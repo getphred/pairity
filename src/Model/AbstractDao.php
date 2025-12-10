@@ -4,6 +4,7 @@ namespace Pairity\Model;
 
 use Pairity\Contracts\ConnectionInterface;
 use Pairity\Contracts\DaoInterface;
+use Pairity\Orm\UnitOfWork;
 
 abstract class AbstractDao implements DaoInterface
 {
@@ -92,6 +93,13 @@ abstract class AbstractDao implements DaoInterface
 
     public function findById(int|string $id): ?AbstractDto
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $managed = $uow->get(static::class, (string)$id);
+            if ($managed instanceof AbstractDto) {
+                return $managed;
+            }
+        }
         return $this->findOneBy([$this->getPrimaryKey() => $id]);
     }
 
@@ -136,6 +144,36 @@ abstract class AbstractDao implements DaoInterface
     /** @param array<string,mixed> $data */
     public function update(int|string $id, array $data): AbstractDto
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            // Defer execution; return a synthesized DTO
+            $existing = $this->findById($id);
+            if (!$existing && empty($data)) {
+                throw new \InvalidArgumentException('No data provided to update and record not found');
+            }
+            $toStore = $this->prepareForUpdate($data);
+            $self = $this;
+            $conn = $this->connection;
+            $uow->enqueue($conn, function () use ($self, $id, $toStore) {
+                UnitOfWork::suspendDuring(function () use ($self, $id, $toStore) {
+                    // execute real update now
+                    $sets = [];
+                    $params = [];
+                    foreach ($toStore as $col => $val) {
+                        $sets[] = "$col = :set_$col";
+                        $params["set_$col"] = $val;
+                    }
+                    $params['pk'] = $id;
+                    $sql = 'UPDATE ' . $self->getTable() . ' SET ' . implode(', ', $sets) . ' WHERE ' . $self->getPrimaryKey() . ' = :pk';
+                    $self->getConnection()->execute($sql, $params);
+                });
+            });
+            $base = $existing ? $existing->toArray(false) : [];
+            $pk = $this->getPrimaryKey();
+            $result = array_merge($base, $data, [$pk => $id]);
+            return $this->hydrate($this->castRowFromStorage($result));
+        }
+
         if (empty($data)) {
             $existing = $this->findById($id);
             if ($existing) return $existing;
@@ -153,7 +191,6 @@ abstract class AbstractDao implements DaoInterface
         $this->connection->execute($sql, $params);
         $updated = $this->findById($id);
         if ($updated === null) {
-            // As a fallback, hydrate using provided data + id
             $pk = $this->getPrimaryKey();
             return $this->hydrate($this->castRowFromStorage(array_merge($data, [$pk => $id])));
         }
@@ -162,6 +199,15 @@ abstract class AbstractDao implements DaoInterface
 
     public function deleteById(int|string $id): int
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $self = $this; $conn = $this->connection; $theId = $id;
+            $uow->enqueue($conn, function () use ($self, $theId) {
+                UnitOfWork::suspendDuring(function () use ($self, $theId) { $self->deleteById($theId); });
+            });
+            // deferred; immediate affected count unknown
+            return 0;
+        }
         if ($this->hasSoftDeletes()) {
             $columns = $this->softDeleteConfig();
             $deletedAt = $columns['deletedAt'] ?? 'deleted_at';
@@ -176,6 +222,14 @@ abstract class AbstractDao implements DaoInterface
     /** @param array<string,mixed> $criteria */
     public function deleteBy(array $criteria): int
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $self = $this; $conn = $this->connection; $crit = $criteria;
+            $uow->enqueue($conn, function () use ($self, $crit) {
+                UnitOfWork::suspendDuring(function () use ($self, $crit) { $self->deleteBy($crit); });
+            });
+            return 0;
+        }
         if ($this->hasSoftDeletes()) {
             [$where, $bindings] = $this->buildWhere($criteria);
             if ($where === '') { return 0; }
@@ -200,6 +254,16 @@ abstract class AbstractDao implements DaoInterface
      */
     public function updateBy(array $criteria, array $data): int
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            if (empty($data)) { return 0; }
+            $self = $this; $conn = $this->connection; $crit = $criteria; $payload = $this->prepareForUpdate($data);
+            $uow->enqueue($conn, function () use ($self, $crit, $payload) {
+                UnitOfWork::suspendDuring(function () use ($self, $crit, $payload) { $self->updateBy($crit, $payload); });
+            });
+            // unknown affected rows until commit
+            return 0;
+        }
         if (empty($data)) {
             return 0;
         }
@@ -457,6 +521,14 @@ abstract class AbstractDao implements DaoInterface
         $class = $this->dtoClass();
         /** @var AbstractDto $dto */
         $dto = $class::fromArray($row);
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $pk = $this->getPrimaryKey();
+            $idVal = $row[$pk] ?? null;
+            if ($idVal !== null) {
+                $uow->attach(static::class, (string)$idVal, $dto);
+            }
+        }
         return $dto;
     }
 

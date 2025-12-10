@@ -3,6 +3,7 @@
 namespace Pairity\NoSql\Mongo;
 
 use Pairity\Model\AbstractDto;
+use Pairity\Orm\UnitOfWork;
 
 /**
  * Base DAO for MongoDB collections returning DTOs.
@@ -131,32 +132,73 @@ abstract class AbstractMongoDao
 
     public function findById(string $id): ?AbstractDto
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $managed = $uow->get(static::class, (string)$id);
+            if ($managed instanceof AbstractDto) {
+                return $managed;
+            }
+        }
         return $this->findOneBy(['_id' => $id]);
     }
 
     /** @param array<string,mixed> $data */
     public function insert(array $data): AbstractDto
     {
-        $id = $this->connection->insertOne($this->databaseName(), $this->collection(), $data);
-        // fetch back
+        // Inserts remain immediate to obtain a real id, even under UoW
+        $id = UnitOfWork::suspendDuring(function () use ($data) {
+            return $this->connection->insertOne($this->databaseName(), $this->collection(), $data);
+        });
         return $this->findById($id) ?? $this->hydrate(array_merge($data, ['_id' => $id]));
     }
 
     /** @param array<string,mixed> $data */
     public function update(string $id, array $data): AbstractDto
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $self = $this; $conn = $this->connection; $theId = $id; $payload = $data;
+            $uow->enqueue($conn, function () use ($self, $theId, $payload) {
+                UnitOfWork::suspendDuring(function () use ($self, $theId, $payload) {
+                    $self->getConnection()->updateOne($self->databaseName(), $self->collection(), ['_id' => $theId], ['$set' => $payload]);
+                });
+            });
+            $base = $this->findById($id)?->toArray(false) ?? [];
+            $result = array_merge($base, $data, ['_id' => $id]);
+            return $this->hydrate($result);
+        }
         $this->connection->updateOne($this->databaseName(), $this->collection(), ['_id' => $id], ['$set' => $data]);
         return $this->findById($id) ?? $this->hydrate(array_merge($data, ['_id' => $id]));
     }
 
     public function deleteById(string $id): int
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $self = $this; $conn = $this->connection; $theId = $id;
+            $uow->enqueue($conn, function () use ($self, $theId) {
+                UnitOfWork::suspendDuring(function () use ($self, $theId) {
+                    $self->getConnection()->deleteOne($self->databaseName(), $self->collection(), ['_id' => $theId]);
+                });
+            });
+            return 0;
+        }
         return $this->connection->deleteOne($this->databaseName(), $this->collection(), ['_id' => $id]);
     }
 
     /** @param array<string,mixed>|Filter $filter */
     public function deleteBy(array|Filter $filter): int
     {
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $self = $this; $conn = $this->connection; $flt = $this->normalizeFilterInput($filter);
+            $uow->enqueue($conn, function () use ($self, $flt) {
+                UnitOfWork::suspendDuring(function () use ($self, $flt) {
+                    $self->getConnection()->deleteOne($self->databaseName(), $self->collection(), $flt);
+                });
+            });
+            return 0;
+        }
         // For MVP provide deleteOne semantic; bulk deletes could be added later
         return $this->connection->deleteOne($this->databaseName(), $this->collection(), $this->normalizeFilterInput($filter));
     }
@@ -236,6 +278,13 @@ abstract class AbstractMongoDao
         $class = $this->dtoClass();
         /** @var AbstractDto $dto */
         $dto = $class::fromArray($doc);
+        $uow = UnitOfWork::current();
+        if ($uow && !UnitOfWork::isSuspended()) {
+            $idVal = $doc['_id'] ?? null;
+            if ($idVal !== null) {
+                $uow->attach(static::class, (string)$idVal, $dto);
+            }
+        }
         return $dto;
     }
 
