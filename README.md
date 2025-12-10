@@ -129,7 +129,52 @@ Notes:
 - SQL Server
 - Oracle
 
-NoSQL: a minimal in‑memory MongoDB stub is included (`Pairity\NoSql\Mongo\MongoConnectionInterface` and `MongoConnection`) for experimentation without external deps.
+NoSQL:
+- MongoDB (production): `Pairity\NoSql\Mongo\MongoClientConnection` via `mongodb/mongodb` + `ext-mongodb`.
+- MongoDB (stub): `Pairity\NoSql\Mongo\MongoConnection` (in‑memory) remains for experimentation without external deps.
+
+### MongoDB (production adapter)
+
+Pairity includes a production‑ready MongoDB adapter that wraps the official `mongodb/mongodb` library.
+
+Requirements:
+- PHP `ext-mongodb` (installed in PHP), and Composer dependency `mongodb/mongodb` (already required by this package).
+
+Connect using the `MongoConnectionManager`:
+
+```php
+use Pairity\NoSql\Mongo\MongoConnectionManager;
+
+// Option A: Full URI
+$conn = MongoConnectionManager::make([
+    'uri' => 'mongodb://user:pass@127.0.0.1:27017/?authSource=admin',
+]);
+
+// Option B: Discrete params
+$conn = MongoConnectionManager::make([
+    'host' => '127.0.0.1',
+    'port' => 27017,
+    // 'username' => 'user',
+    // 'password' => 'pass',
+    // 'authSource' => 'admin',
+    // 'replicaSet' => 'rs0',
+    // 'tls' => false,
+]);
+
+// Basic CRUD
+$db = 'app';
+$col = 'users';
+
+$id = $conn->insertOne($db, $col, ['email' => 'mongo@example.com', 'name' => 'Alice']);
+$one = $conn->find($db, $col, ['_id' => $id]);
+$conn->updateOne($db, $col, ['_id' => $id], ['$set' => ['name' => 'Alice Updated']]);
+$conn->deleteOne($db, $col, ['_id' => $id]);
+```
+
+Notes:
+- `_id` strings that look like 24‑hex ObjectIds are automatically converted to `ObjectId` on input; returned documents convert `ObjectId` back to strings.
+- Aggregation pipelines are supported via `$conn->aggregate($db, $collection, $pipeline, $options)`.
+- See `examples/nosql/mongo_crud.php` for a runnable demo.
 
 ## Raw SQL
 

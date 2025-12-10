@@ -133,6 +133,9 @@ Usage:
   pairity status [--path=DIR] [--config=FILE]
   pairity reset [--config=FILE]
   pairity make:migration Name [--path=DIR]
+  pairity mongo:index:ensure DB COLLECTION KEYS_JSON [--unique]
+  pairity mongo:index:drop DB COLLECTION NAME
+  pairity mongo:index:list DB COLLECTION
 
 Environment:
   DB_DRIVER, DB_HOST, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD, DB_PATH (for sqlite)
@@ -241,6 +244,51 @@ return new class implements MigrationInterface {
 PHP;
             file_put_contents($file, $template);
             stdout('Created: ' . $file);
+            break;
+
+        case 'mongo:index:ensure':
+            // Args: DB COLLECTION KEYS_JSON [--unique]
+            $db = $args[0] ?? null;
+            $col = $args[1] ?? null;
+            $keysJson = $args[2] ?? null;
+            if (!$db || !$col || !$keysJson) {
+                stderr('Usage: pairity mongo:index:ensure DB COLLECTION KEYS_JSON [--unique]');
+                exit(1);
+            }
+            $config = loadConfig($args);
+            $conn = \Pairity\NoSql\Mongo\MongoConnectionManager::make($config);
+            $idx = new \Pairity\NoSql\Mongo\IndexManager($conn, $db, $col);
+            $keys = json_decode($keysJson, true);
+            if (!is_array($keys)) { stderr('Invalid KEYS_JSON (must be object like {"email":1})'); exit(1); }
+            $opts = [];
+            if (!empty($args['unique'])) { $opts['unique'] = true; }
+            $name = $idx->ensureIndex($keys, $opts);
+            stdout('Ensured index: ' . $name);
+            break;
+
+        case 'mongo:index:drop':
+            // Args: DB COLLECTION NAME
+            $db = $args[0] ?? null;
+            $col = $args[1] ?? null;
+            $name = $args[2] ?? null;
+            if (!$db || !$col || !$name) { stderr('Usage: pairity mongo:index:drop DB COLLECTION NAME'); exit(1); }
+            $config = loadConfig($args);
+            $conn = \Pairity\NoSql\Mongo\MongoConnectionManager::make($config);
+            $idx = new \Pairity\NoSql\Mongo\IndexManager($conn, $db, $col);
+            $idx->dropIndex($name);
+            stdout('Dropped index: ' . $name);
+            break;
+
+        case 'mongo:index:list':
+            // Args: DB COLLECTION
+            $db = $args[0] ?? null;
+            $col = $args[1] ?? null;
+            if (!$db || !$col) { stderr('Usage: pairity mongo:index:list DB COLLECTION'); exit(1); }
+            $config = loadConfig($args);
+            $conn = \Pairity\NoSql\Mongo\MongoConnectionManager::make($config);
+            $idx = new \Pairity\NoSql\Mongo\IndexManager($conn, $db, $col);
+            $list = $idx->listIndexes();
+            stdout(json_encode($list));
             break;
 
         default:

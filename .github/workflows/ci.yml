@@ -25,6 +25,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 20
+      mongo:
+        image: mongo:6
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,7 +42,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: pdo, pdo_mysql, pdo_sqlite
+          extensions: pdo, pdo_mysql, pdo_sqlite, mongodb
           coverage: none
 
       - name: Install dependencies
@@ -59,5 +68,7 @@ jobs:
           MYSQL_DB: pairity
           MYSQL_USER: root
           MYSQL_PASS: root
+          MONGO_HOST: 127.0.0.1
+          MONGO_PORT: 27017
         run: |
           vendor/bin/phpunit --colors=always
