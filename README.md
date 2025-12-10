@@ -496,6 +496,45 @@ $deep    = array_map(fn($u) => $u->toArray(), $users);       // deep (default)
 $shallow = array_map(fn($u) => $u->toArray(false), $users);  // shallow
 ```
 
+## Unit of Work (opt-in)
+
+Pairity offers an optional Unit of Work (UoW) that you can enable per block to batch and order mutations atomically, while keeping the familiar DAO/DTO API.
+
+What it gives you:
+- Identity Map: the same in-memory DTO instance per `[DAO class + id]` during the UoW scope.
+- Deferred mutations: inside a UoW, `update()`, `updateBy()`, `deleteById()`, and `deleteBy()` are queued and executed on commit in a transaction/session.
+- Atomicity: SQL paths use a transaction per connection; Mongo uses a session/transaction when supported.
+
+What stays the same:
+- Outside a UoW scope, DAOs behave exactly as before (immediate execution).
+- Inside a UoW, `insert()` executes immediately to return the real ID.
+
+Basic usage:
+
+```php
+use Pairity\Orm\UnitOfWork;
+
+UnitOfWork::run(function(UnitOfWork $uow) use ($userDao, $postDao) {
+    $user = $userDao->findById(42);            // managed instance via identity map
+    $userDao->update(42, ['name' => 'New']);   // deferred
+    $postDao->insert(['user_id' => 42, 'title' => 'Hello']); // immediate (real id)
+    $postDao->deleteBy(['title' => 'Old']);    // deferred
+}); // commits or rolls back on exception
+```
+
+Manual scoping:
+
+```php
+$uow = UnitOfWork::begin();
+// ... perform DAO calls ...
+$uow->commit(); // or $uow->rollback();
+```
+
+Caveats and notes:
+- Inserts are immediate by design to obtain primary keys; updates/deletes are deferred.
+- If you need to force an immediate operation within a UoW (for advanced cases), DAOs use an internal `UnitOfWork::suspendDuring()` helper to avoid re-enqueueing nested calls.
+- The UoW MVP does not yet apply cascade rules; ordering is per-connection in enqueue order.
+
 ## Roadmap
 
 - Relations enhancements:
