@@ -535,6 +535,34 @@ Caveats and notes:
 - If you need to force an immediate operation within a UoW (for advanced cases), DAOs use an internal `UnitOfWork::suspendDuring()` helper to avoid re-enqueueing nested calls.
 - The UoW MVP does not yet apply cascade rules; ordering is per-connection in enqueue order.
 
+### Relation-aware delete ordering and cascades (MVP)
+
+- When you enable a UoW and enqueue a parent delete via `deleteById()`, Pairity will automatically delete child rows/documents first for relations marked with a cascade flag, then execute the parent delete. This ensures referential integrity without manual orchestration.
+
+- Supported relation types for cascades: `hasMany`, `hasOne`.
+
+- Enable cascades by adding a flag to the relation metadata in your DAO:
+
+```php
+protected function relations(): array
+{
+    return [
+        'posts' => [
+            'type' => 'hasMany',
+            'dao'  => PostDao::class,
+            'foreignKey' => 'user_id',
+            'localKey'   => 'id',
+            'cascadeDelete' => true, // or: 'cascade' => ['delete' => true]
+        ],
+    ];
+}
+```
+
+Behavior details:
+- Inside `UnitOfWork::run(...)`, enqueuing `UserDao->deleteById($id)` will synthesize and run `PostDao->deleteBy(['user_id' => $id])` before deleting the user.
+- Works for both SQL DAOs and Mongo DAOs.
+- Current MVP focuses on delete cascades; cascades for updates and more advanced ordering rules can be added later.
+
 ## Roadmap
 
 - Relations enhancements:
