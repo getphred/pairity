@@ -1,0 +1,253 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use Pairity\Database\ConnectionManager;
+use Pairity\Migrations\Migrator;
+use Pairity\Migrations\MigrationLoader;
+
+// Simple CLI utility for migrations
+
+function stderr(string $msg): void { fwrite(STDERR, $msg . PHP_EOL); }
+function stdout(string $msg): void { fwrite(STDOUT, $msg . PHP_EOL); }
+
+function parseArgs(array $argv): array {
+    $args = ['_cmd' => $argv[1] ?? 'help'];
+    for ($i = 2; $i < count($argv); $i++) {
+        $a = $argv[$i];
+        if (str_starts_with($a, '--')) {
+            $eq = strpos($a, '=');
+            if ($eq !== false) {
+                $key = substr($a, 2, $eq - 2);
+                $val = substr($a, $eq + 1);
+                $args[$key] = $val;
+            } else {
+                $key = substr($a, 2);
+                $args[$key] = true;
+            }
+        } else {
+            $args[] = $a;
+        }
+    }
+    return $args;
+}
+
+function loadConfig(array $args): array {
+    // Priority: --config=path.php (must return array), else env vars, else SQLite db.sqlite in project root
+    if (isset($args['config'])) {
+        $path = (string)$args['config'];
+        if (!is_file($path)) {
+            throw new InvalidArgumentException("Config file not found: {$path}");
+        }
+        $cfg = require $path;
+        if (!is_array($cfg)) {
+            throw new InvalidArgumentException('Config file must return an array');
+        }
+        return $cfg;
+    }
+
+    $driver = getenv('DB_DRIVER') ?: null;
+    if ($driver) {
+        $driver = strtolower($driver);
+        $cfg = ['driver' => $driver];
+        switch ($driver) {
+            case 'mysql':
+            case 'mariadb':
+                $cfg += [
+                    'host' => getenv('DB_HOST') ?: '127.0.0.1',
+                    'port' => (int)(getenv('DB_PORT') ?: 3306),
+                    'database' => getenv('DB_DATABASE') ?: '',
+                    'username' => getenv('DB_USERNAME') ?: null,
+                    'password' => getenv('DB_PASSWORD') ?: null,
+                    'charset'  => getenv('DB_CHARSET') ?: 'utf8mb4',
+                ];
+                break;
+            case 'pgsql':
+            case 'postgres':
+            case 'postgresql':
+                $cfg += [
+                    'host' => getenv('DB_HOST') ?: '127.0.0.1',
+                    'port' => (int)(getenv('DB_PORT') ?: 5432),
+                    'database' => getenv('DB_DATABASE') ?: '',
+                    'username' => getenv('DB_USERNAME') ?: null,
+                    'password' => getenv('DB_PASSWORD') ?: null,
+                ];
+                break;
+            case 'sqlsrv':
+            case 'mssql':
+                $cfg += [
+                    'host' => getenv('DB_HOST') ?: '127.0.0.1',
+                    'port' => (int)(getenv('DB_PORT') ?: 1433),
+                    'database' => getenv('DB_DATABASE') ?: '',
+                    'username' => getenv('DB_USERNAME') ?: null,
+                    'password' => getenv('DB_PASSWORD') ?: null,
+                ];
+                break;
+            case 'sqlite':
+                $cfg += [
+                    'path' => getenv('DB_PATH') ?: (__DIR__ . '/../db.sqlite'),
+                ];
+                break;
+            default:
+                // fall back later
+                break;
+        }
+        return $cfg;
+    }
+
+    // Default: SQLite file in project root
+    return [
+        'driver' => 'sqlite',
+        'path' => __DIR__ . '/../db.sqlite',
+    ];
+}
+
+function migrationsDir(array $args): string {
+    if (isset($args['path'])) return (string)$args['path'];
+    $candidates = [getcwd() . '/database/migrations', __DIR__ . '/../database/migrations', __DIR__ . '/../examples/migrations'];
+    foreach ($candidates as $dir) {
+        if (is_dir($dir)) return $dir;
+    }
+    return __DIR__ . '/../examples/migrations';
+}
+
+function ensureDir(string $dir): void {
+    if (!is_dir($dir)) {
+        if (!mkdir($dir, 0777, true) && !is_dir($dir)) {
+            throw new RuntimeException('Failed to create directory: ' . $dir);
+        }
+    }
+}
+
+function cmd_help(): void
+{
+    $help = <<<TXT
+Pairity CLI
+
+Usage:
+  pairity migrate [--path=DIR] [--config=FILE]
+  pairity rollback [--steps=N] [--config=FILE]
+  pairity status [--path=DIR] [--config=FILE]
+  pairity reset [--config=FILE]
+  pairity make:migration Name [--path=DIR]
+
+Environment:
+  DB_DRIVER, DB_HOST, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD, DB_PATH (for sqlite)
+
+If --config is provided, it must be a PHP file returning the ConnectionManager config array.
+TXT;
+    stdout($help);
+}
+
+$args = parseArgs($argv);
+$cmd = $args['_cmd'] ?? 'help';
+
+try {
+    switch ($cmd) {
+        case 'migrate':
+            $config = loadConfig($args);
+            $conn = ConnectionManager::make($config);
+            $dir = migrationsDir($args);
+            $migrations = MigrationLoader::fromDirectory($dir);
+            if (!$migrations) {
+                stdout('No migrations found in ' . $dir);
+                exit(0);
+            }
+            $migrator = new Migrator($conn);
+            $migrator->setRegistry($migrations);
+            $applied = $migrator->migrate($migrations);
+            stdout('Applied: ' . json_encode($applied));
+            break;
+
+        case 'rollback':
+            $config = loadConfig($args);
+            $conn = ConnectionManager::make($config);
+            $dir = migrationsDir($args);
+            $migrations = MigrationLoader::fromDirectory($dir);
+            $migrator = new Migrator($conn);
+            $migrator->setRegistry($migrations);
+            $steps = isset($args['steps']) ? max(1, (int)$args['steps']) : 1;
+            $rolled = $migrator->rollback($steps);
+            stdout('Rolled back: ' . json_encode($rolled));
+            break;
+
+        case 'status':
+            $config = loadConfig($args);
+            $conn = ConnectionManager::make($config);
+            $dir = migrationsDir($args);
+            $migrations = array_keys(MigrationLoader::fromDirectory($dir));
+            $repo = new \Pairity\Migrations\MigrationsRepository($conn);
+            $ran = $repo->getRan();
+            $pending = array_values(array_diff($migrations, $ran));
+            stdout('Ran: ' . json_encode($ran));
+            stdout('Pending: ' . json_encode($pending));
+            break;
+
+        case 'reset':
+            $config = loadConfig($args);
+            $conn = ConnectionManager::make($config);
+            $dir = migrationsDir($args);
+            $migrations = MigrationLoader::fromDirectory($dir);
+            $migrator = new Migrator($conn);
+            $migrator->setRegistry($migrations);
+            $totalRolled = [];
+            while (true) {
+                $rolled = $migrator->rollback(1);
+                if (!$rolled) break;
+                $totalRolled = array_merge($totalRolled, $rolled);
+            }
+            stdout('Reset complete. Rolled back: ' . json_encode($totalRolled));
+            break;
+
+        case 'make:migration':
+            $name = $args[0] ?? null;
+            if (!$name) {
+                stderr('Missing migration Name. Usage: pairity make:migration CreateUsersTable [--path=DIR]');
+                exit(1);
+            }
+            $dir = migrationsDir($args);
+            ensureDir($dir);
+            $ts = date('Y_m_d_His');
+            $file = $dir . DIRECTORY_SEPARATOR . $ts . '_' . $name . '.php';
+            $template = <<<'PHP'
+<?php
+
+use Pairity\Migrations\MigrationInterface;
+use Pairity\Contracts\ConnectionInterface;
+use Pairity\Schema\SchemaManager;
+use Pairity\Schema\Blueprint;
+
+return new class implements MigrationInterface {
+    public function up(ConnectionInterface $connection): void
+    {
+        // Example: create table
+        // $schema = SchemaManager::forConnection($connection);
+        // $schema->create('example', function (Blueprint $t) {
+        //     $t->increments('id');
+        //     $t->string('name', 255);
+        // });
+    }
+
+    public function down(ConnectionInterface $connection): void
+    {
+        // Example: drop table
+        // $schema = SchemaManager::forConnection($connection);
+        // $schema->dropIfExists('example');
+    }
+};
+PHP;
+            file_put_contents($file, $template);
+            stdout('Created: ' . $file);
+            break;
+
+        default:
+            cmd_help();
+            break;
+    }
+} catch (Throwable $e) {
+    stderr('Error: ' . $e->getMessage());
+    exit(1);
+}

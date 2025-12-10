@@ -1,3 +1,465 @@
 # Pairity
 
-A partitioned model ORM. Handles DAO and DTO objects
+A partitioned‑model PHP ORM (DTO/DAO) with Query Builder, relations, raw SQL helpers, and a portable migrations + schema builder. Namespace: `Pairity\`. Package: `getphred/pairity`.
+
+## Contributing
+
+This is an early foundation. Contributions, discussions, and design proposals are welcome. Please open an issue to coordinate larger features.
+
+## License
+
+MIT
+
+## Installation
+
+- Requirements: PHP >= 8.1, PDO extension for your database(s)
+- Install via Composer:
+
+```
+composer require getphred/pairity
+```
+
+After install, you can use the CLI at `vendor/bin/pairity`.
+
+## Quick start
+
+Minimal example with SQLite (file db.sqlite) and a simple `users` DAO/DTO.
+
+```php
+use Pairity\Database\ConnectionManager;
+use Pairity\Model\AbstractDto;
+use Pairity\Model\AbstractDao;
+
+// 1) Connect
+$conn = ConnectionManager::make([
+    'driver' => 'sqlite',
+    'path'   => __DIR__ . '/db.sqlite',
+]);
+
+// 2) Ensure table exists (demo)
+$conn->execute('CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL,
+  name TEXT NULL,
+  status TEXT NULL
+)');
+
+// 3) Define DTO + DAO
+class UserDto extends AbstractDto {}
+class UserDao extends AbstractDao {
+    public function getTable(): string { return 'users'; }
+    protected function dtoClass(): string { return UserDto::class; }
+}
+
+// 4) CRUD
+$dao = new UserDao($conn);
+$created = $dao->insert(['email' => 'a@b.com', 'name' => 'Alice', 'status' => 'active']);
+$one = $dao->findById($created->toArray()['id']);
+$many = $dao->findAllBy(['status' => 'active']);
+$dao->update($created->toArray()['id'], ['name' => 'Alice Updated']);
+$dao->deleteById($created->toArray()['id']);
+```
+
+For MySQL, configure:
+
+```php
+$conn = ConnectionManager::make([
+  'driver' => 'mysql',
+  'host' => '127.0.0.1',
+  'port' => 3306,
+  'database' => 'app',
+  'username' => 'root',
+  'password' => 'secret',
+  'charset'  => 'utf8mb4',
+]);
+```
+
+## Concepts
+
+- DTO (Data Transfer Object): a lightweight data bag. Extend `Pairity\Model\AbstractDto`. Convert to arrays via `toArray(bool $deep = true)`.
+- DAO (Data Access Object): table‑focused persistence and relations. Extend `Pairity\Model\AbstractDao` and implement:
+  - `getTable(): string`
+  - `dtoClass(): string` (class-string of your DTO)
+  - Optional: `schema()` for casts, timestamps, soft deletes
+  - Optional: `relations()` for `hasOne`/`hasMany`/`belongsTo`
+- Relations are DAO‑centric: call `with([...])` to eager load; `load()`/`loadMany()` for lazy.
+- Field projection via `fields('id', 'name', 'posts.title')` with dot‑notation for related selects.
+- Raw SQL: use `ConnectionInterface::query`, `execute`, `transaction`, `lastInsertId`.
+- Query Builder: a simple builder (`Pairity\Query\QueryBuilder`) exists for ad‑hoc SQL composition.
+
+## Dynamic DAO methods
+
+AbstractDao supports dynamic helpers, mapped to column names (Studly/camel to snake_case):
+
+- `findOneBy<Column>($value): ?DTO`
+- `findAllBy<Column>($value): DTO[]`
+- `updateBy<Column>($value, array $data): int` (returns affected rows)
+- `deleteBy<Column>($value): int`
+
+Examples:
+
+```php
+$user = $dao->findOneByEmail('a@b.com');
+$actives = $dao->findAllByStatus('active');
+$dao->updateByEmail('a@b.com', ['name' => 'New Name']);
+$dao->deleteByEmail('gone@b.com');
+```
+
+## Selecting fields
+
+- Default projection is `SELECT *`.
+- Use `fields(...$fields)` to limit columns. You can include relation fields using dot‑notation:
+
+```php
+$users = (new UserDao($conn))
+  ->fields('id', 'name', 'posts.title')
+  ->with(['posts'])
+  ->findAllBy(['status' => 'active']);
+```
+
+Notes:
+- `fields()` affects only the next `find*` call and then resets.
+- Relation field selections are passed to the related DAO when eager loading.
+
+## Supported databases
+
+- MySQL/MariaDB
+- SQLite
+- PostgreSQL
+- SQL Server
+- Oracle
+
+NoSQL: a minimal in‑memory MongoDB stub is included (`Pairity\NoSql\Mongo\MongoConnectionInterface` and `MongoConnection`) for experimentation without external deps.
+
+## Raw SQL
+
+Use the `ConnectionInterface` behind your DAO for direct SQL.
+
+```php
+use Pairity\Contracts\ConnectionInterface;
+
+// Get connection from DAO
+$conn = $dao->getConnection();
+
+// SELECT
+$rows = $conn->query('SELECT id, email FROM users WHERE status = :s', ['s' => 'active']);
+
+// INSERT/UPDATE/DELETE
+$affected = $conn->execute('UPDATE users SET status = :s WHERE id = :id', ['s' => 'inactive', 'id' => 10]);
+
+// Transaction
+$conn->transaction(function (ConnectionInterface $db) {
+    $db->execute('INSERT INTO logs(message) VALUES(:m)', ['m' => 'started']);
+    // ...
+});
+```
+
+## Relations (DAO‑centric MVP)
+
+Declare relations in your DAO by overriding `relations()` and use `with()` for eager loading or `load()`/`loadMany()` for lazy loading.
+
+Example: `User hasMany Posts`, `Post belongsTo User`
+
+```php
+use Pairity\Model\AbstractDto;
+use Pairity\Model\AbstractDao;
+
+class UserDto extends AbstractDto {}
+class PostDto extends AbstractDto {}
+
+class UserDao extends AbstractDao {
+    public function getTable(): string { return 'users'; }
+    protected function dtoClass(): string { return UserDto::class; }
+    protected function relations(): array {
+        return [
+            'posts' => [
+                'type' => 'hasMany',
+                'dao' => PostDao::class,
+                'dto' => PostDto::class,
+                'foreignKey' => 'user_id', // on posts
+                'localKey'   => 'id',      // on users
+            ],
+        ];
+    }
+}
+
+class PostDao extends AbstractDao {
+    public function getTable(): string { return 'posts'; }
+    protected function dtoClass(): string { return PostDto::class; }
+    protected function relations(): array {
+        return [
+            'user' => [
+                'type' => 'belongsTo',
+                'dao'  => UserDao::class,
+                'dto'  => UserDto::class,
+                'foreignKey' => 'user_id', // on posts
+                'otherKey'   => 'id',      // on users
+            ],
+        ];
+    }
+}
+
+$users = (new UserDao($conn))
+    ->fields('id', 'name', 'posts.title')
+    ->with(['posts'])
+    ->findAllBy(['status' => 'active']);
+
+// Lazy load a relation later
+$postDao = new PostDao($conn);
+$post = $postDao->findOneBy(['id' => 10]);
+$postDao->load($post, 'user');
+```
+
+Notes:
+- Eager loader batches queries using `IN (...)` lookups under the hood.
+- Loaded relations are attached onto the DTO under the relation name (e.g., `$user->posts`).
+- `hasOne` is supported like `hasMany` but attaches a single DTO instead of a list.
+
+## Model metadata & schema mapping (MVP)
+
+Define schema metadata on your DAO by overriding `schema()`. The schema enables:
+- Column casts (storage <-> PHP): `int`, `float`, `bool`, `string`, `datetime`, `json`
+- Timestamps automation (`createdAt`, `updatedAt` filled automatically)
+- Soft deletes (update `deletedAt` instead of hard delete, with query scopes)
+
+Example:
+
+```php
+use Pairity\Model\AbstractDao;
+
+class UserDao extends AbstractDao
+{
+    public function getTable(): string { return 'users'; }
+    protected function dtoClass(): string { return UserDto::class; }
+
+    // Optional: declare primary key, casts, timestamps, soft deletes
+    protected function schema(): array
+    {
+        return [
+            'primaryKey' => 'id',
+            'columns' => [
+                'id' => ['cast' => 'int'],
+                'email' => ['cast' => 'string'],
+                'name' => ['cast' => 'string'],
+                'status' => ['cast' => 'string'],
+                // if present in your table
+                'data' => ['cast' => 'json'],
+                'created_at' => ['cast' => 'datetime'],
+                'updated_at' => ['cast' => 'datetime'],
+                'deleted_at' => ['cast' => 'datetime'],
+            ],
+            'timestamps' => [
+                'createdAt' => 'created_at',
+                'updatedAt' => 'updated_at',
+            ],
+            'softDeletes' => [
+                'enabled' => true,
+                'deletedAt' => 'deleted_at',
+            ],
+        ];
+    }
+}
+
+// Usage (defaults to SELECT * unless you call fields())
+$users = (new UserDao($conn))
+    ->findAllBy(['status' => 'active']);
+
+// Soft delete vs hard delete
+(new UserDao($conn))->deleteById(10); // if softDeletes enabled => sets deleted_at timestamp
+
+// Query scopes for soft deletes
+$all = (new UserDao($conn))->withTrashed()->findAllBy();     // include soft-deleted rows
+$trashedOnly = (new UserDao($conn))->onlyTrashed()->findAllBy(); // only soft-deleted
+
+// Casting on hydration and storage
+$user = (new UserDao($conn))->findById(1); // date columns become DateTimeImmutable; json becomes array
+$created = (new UserDao($conn))->insert([
+    'email' => 'a@b.com',
+    'name' => 'Alice',
+    'status' => 'active',
+    'data' => ['tags' => ['a','b']], // stored as JSON automatically
+]);
+```
+
+### Timestamps & Soft Deletes
+
+- Configure in your DAO `schema()` using keys:
+  - `timestamps` → `['createdAt' => 'created_at', 'updatedAt' => 'updated_at']`
+  - `softDeletes` → `['enabled' => true, 'deletedAt' => 'deleted_at']`
+- Behavior:
+  - On `insert()`, both `created_at` and `updated_at` are auto-filled (UTC `Y-m-d H:i:s`).
+  - On `update()` and `updateBy()`, `updated_at` is auto-updated.
+  - On `deleteById()` / `deleteBy()`, if soft deletes are enabled, rows are marked by setting `deleted_at` instead of being physically removed.
+  - Default queries exclude soft-deleted rows. Use scopes `withTrashed()` and `onlyTrashed()` to modify visibility.
+  - Helpers:
+    - `restoreById($id)` / `restoreBy($criteria)` — set `deleted_at` to NULL.
+    - `forceDeleteById($id)` / `forceDeleteBy($criteria)` — permanently delete.
+    - `touch($id)` — update only the `updated_at` column.
+
+Example:
+
+```php
+$dao = new UserDao($conn);
+$user = $dao->insert(['email' => 'x@y.com']); // created_at/updated_at filled
+$dao->update($user->id, ['name' => 'Updated']); // updated_at bumped
+$dao->deleteById($user->id); // soft delete
+$also = $dao->withTrashed()->findById($user->id); // visible with trashed
+$dao->restoreById($user->id); // restore
+$dao->forceDeleteById($user->id); // permanent
+```
+
+## Migrations & Schema Builder
+
+Pairity ships a lightweight migrations runner and a portable schema builder focused on MySQL and SQLite for v1. You can declare migrations as PHP classes implementing `Pairity\Migrations\MigrationInterface` and build tables with a fluent `Schema` builder.
+
+Supported:
+- Table operations: `create`, `drop`, `dropIfExists`, `table(...)` (ALTER)
+- Columns: `increments`, `bigIncrements`, `integer`, `bigInteger`, `string(varchar)`, `text`, `boolean`, `json`, `datetime`, `decimal(precision, scale)`, `timestamps()`
+- Indexes: `primary([...])`, `unique([...], ?name)`, `index([...], ?name)`
+- ALTER (MVP): `add column` (all drivers), `drop column` (MySQL, Postgres, SQL Server; SQLite 3.35+), `rename column` (MySQL 8+/Postgres/SQL Server; SQLite 3.25+), `add/drop index/unique`, `rename table`
+- Drivers: MySQL/MariaDB (default), SQLite (auto-detected), PostgreSQL (pgsql), SQL Server (sqlsrv), Oracle (oci)
+
+Example migration (see `examples/migrations/CreateUsersTable.php`):
+
+```php
+use Pairity\Migrations\MigrationInterface;
+use Pairity\Contracts\ConnectionInterface;
+use Pairity\Schema\SchemaManager;
+use Pairity\Schema\Blueprint;
+
+return new class implements MigrationInterface {
+    public function up(ConnectionInterface $connection): void
+    {
+        $schema = SchemaManager::forConnection($connection);
+        $schema->create('users', function (Blueprint $t) {
+            $t->increments('id');
+            $t->string('email', 190);
+            $t->unique(['email']);
+            $t->string('name', 255)->nullable();
+            $t->string('status', 50)->nullable();
+            $t->timestamps();
+        });
+    }
+
+    public function down(ConnectionInterface $connection): void
+    {
+        $schema = SchemaManager::forConnection($connection);
+        $schema->dropIfExists('users');
+    }
+};
+```
+
+Running migrations (SQLite example):
+
+```php
+<?php
+require __DIR__.'/../vendor/autoload.php';
+
+use Pairity\Database\ConnectionManager;
+use Pairity\Migrations\Migrator;
+
+$conn = ConnectionManager::make([
+    'driver' => 'sqlite',
+    'path'   => __DIR__ . '/../db.sqlite',
+]);
+
+$createUsers = require __DIR__ . '/migrations/CreateUsersTable.php';
+
+$migrator = new Migrator($conn);
+$migrator->setRegistry(['CreateUsersTable' => $createUsers]);
+
+$applied = $migrator->migrate(['CreateUsersTable' => $createUsers]);
+echo 'Applied: ' . json_encode($applied) . PHP_EOL;
+```
+
+Notes:
+- The migrations runner tracks applied migrations in a `migrations` table with batches.
+- For rollback, keep a registry of name => instance in the same process or use class names that can be autoloaded.
+- SQLite has limitations around `ALTER TABLE` operations; this MVP emits native `ALTER TABLE` for supported versions (ADD COLUMN always; RENAME/DROP COLUMN require modern SQLite). For legacy versions, operations may fail; rebuild strategies can be added later.
+  - Pairity includes a best-effort table rebuild fallback for legacy SQLite: when `DROP COLUMN`/`RENAME COLUMN` is unsupported, it recreates the table and copies data. Complex constraints/triggers may not be preserved.
+
+### CLI
+
+Pairity ships a tiny CLI for migrations. After `composer install`, the binary is available as `vendor/bin/pairity` or as a project bin if installed as a dependency.
+
+Usage:
+
+```
+pairity migrate [--path=DIR] [--config=FILE]
+pairity rollback [--steps=N] [--config=FILE]
+pairity status [--path=DIR] [--config=FILE]
+pairity reset [--config=FILE]
+pairity make:migration Name [--path=DIR]
+```
+
+Options and environment:
+
+- If `--config=FILE` is provided, it must be a PHP file returning the ConnectionManager config array.
+- Otherwise, the CLI reads environment variables:
+  - `DB_DRIVER` (mysql|mariadb|pgsql|postgres|postgresql|sqlite|sqlsrv)
+  - `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`, `DB_CHARSET` (MySQL)
+  - `DB_PATH` (SQLite path)
+- If nothing is provided, defaults to a SQLite file at `db.sqlite` in project root.
+
+Migration discovery:
+- The CLI looks for migrations in `./database/migrations`, then `project/database/migrations`, then `examples/migrations`.
+- Each PHP file should `return` a `MigrationInterface` instance (see examples). Files are applied in filename order.
+
+Example ALTER migration (users add bio):
+
+```php
+return new class implements MigrationInterface {
+    public function up(ConnectionInterface $connection): void
+    {
+        $schema = SchemaManager::forConnection($connection);
+        $schema->table('users', function (Blueprint $t) {
+            $t->string('bio', 500)->nullable();
+            $t->index(['status'], 'users_status_index');
+        });
+    }
+    public function down(ConnectionInterface $connection): void
+    {
+        $schema = SchemaManager::forConnection($connection);
+        $schema->table('users', function (Blueprint $t) {
+            $t->dropIndex('users_status_index');
+            $t->dropColumn('bio');
+        });
+    }
+};
+```
+
+Notes:
+- Schema is optional; if omitted, DAOs behave as before (no casting, no timestamps/soft deletes).
+- Timestamps use UTC and the format `Y-m-d H:i:s` for portability.
+- Default `SELECT` is `*`. To limit columns, use `fields()`; it always takes precedence.
+
+## DTO toArray (deep vs shallow)
+
+DTOs implement `toArray(bool $deep = true)`.
+
+- When `$deep` is true (default): the DTO is converted to an array and any related DTOs (including arrays of DTOs) are recursively converted.
+- When `$deep` is false: only the top-level attributes are converted; related DTOs remain as objects.
+
+Example:
+
+```php
+$users = (new UserDao($conn))
+    ->with(['posts'])
+    ->findAllBy(['status' => 'active']);
+
+$deep    = array_map(fn($u) => $u->toArray(), $users);       // deep (default)
+$shallow = array_map(fn($u) => $u->toArray(false), $users);  // shallow
+```
+
+## Roadmap
+
+- Relations enhancements:
+  - Nested eager loading (e.g., `posts.comments`)
+  - `belongsToMany` (pivot tables)
+  - Optional join‑based eager loading strategy
+- Unit of Work & Identity Map
+- Schema builder: broader ALTER coverage and more dialect nuances; better SQLite rebuild for complex constraints
+- CLI: additional commands and quality‑of‑life improvements
+- Testing matrix and examples for more drivers
+- Caching layer and query logging hooks
+- Production NoSQL adapters (MongoDB driver integration)
