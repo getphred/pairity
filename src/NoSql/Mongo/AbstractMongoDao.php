@@ -23,6 +23,17 @@ abstract class AbstractMongoDao
 
     /** @var array<int,string> */
     private array $with = [];
+    /**
+     * Nested eager-loading tree for Mongo relations, built from with() paths.
+     * @var array<string, array<string,mixed>>
+     */
+    private array $withTree = [];
+    /**
+     * Per relation (and nested path) constraints. Keys are relation paths like 'posts' or 'posts.comments'.
+     * Values are callables(AbstractMongoDao $dao): void
+     * @var array<string, callable>
+     */
+    private array $withConstraints = [];
     /** @var array<string, array<int,string>> */
     private array $relationFields = [];
 
@@ -353,7 +364,19 @@ abstract class AbstractMongoDao
     /** Eager load relations on next find* call. */
     public function with(array $relations): static
     {
-        $this->with = $relations;
+        // Accept ['rel', 'rel.child'] or ['rel' => callable]
+        $tree = [];
+        foreach ($relations as $key => $value) {
+            if (is_int($key)) {
+                $this->insertRelationPath($tree, (string)$value);
+            } else {
+                $path = (string)$key;
+                if (is_callable($value)) { $this->withConstraints[$path] = $value; }
+                $this->insertRelationPath($tree, $path);
+            }
+        }
+        $this->withTree = $tree;
+        $this->with = array_keys($tree);
         return $this;
     }
 
@@ -387,6 +410,9 @@ abstract class AbstractMongoDao
 
             /** @var class-string<\Pairity\NoSql\Mongo\AbstractMongoDao> $daoClass */
             $related = new $daoClass($this->connection);
+            // Apply per-relation constraint if provided
+            $constraint = $this->constraintForPath($name);
+            if (is_callable($constraint)) { $constraint($related); }
             $relFields = $this->relationFields[$name] ?? null;
             if ($relFields) { $related->fields(...$relFields); }
 
@@ -418,6 +444,18 @@ abstract class AbstractMongoDao
                         $p->setRelation($name, $list);
                     }
                 }
+                // Nested eager for children
+                $nested = $this->withTree[$name] ?? [];
+                if ($nested) {
+                    $related->with($this->rebuildNestedForChild($name, $nested));
+                    $allChildren = [];
+                    foreach ($parents as $p) {
+                        $val = $p->toArray(false)[$name] ?? null;
+                        if ($val instanceof AbstractDto) { $allChildren[] = $val; }
+                        elseif (is_array($val)) { foreach ($val as $c) { if ($c instanceof AbstractDto) { $allChildren[] = $c; } } }
+                    }
+                    if ($allChildren) { $related->attachRelations($allChildren); }
+                }
             } elseif ($type === 'belongsTo') {
                 $foreignKey = (string)($cfg['foreignKey'] ?? ''); // on parent
                 $otherKey = (string)($cfg['otherKey'] ?? '_id');   // on related
@@ -441,10 +479,23 @@ abstract class AbstractMongoDao
                     $fk = isset($arr[$foreignKey]) ? (string)$arr[$foreignKey] : null;
                     $p->setRelation($name, ($fk !== null && isset($byId[$fk])) ? $byId[$fk] : null);
                 }
+                // Nested eager for owner
+                $nested = $this->withTree[$name] ?? [];
+                if ($nested) {
+                    $related->with($this->rebuildNestedForChild($name, $nested));
+                    $allOwners = [];
+                    foreach ($parents as $p) {
+                        $val = $p->toArray(false)[$name] ?? null;
+                        if ($val instanceof AbstractDto) { $allOwners[] = $val; }
+                    }
+                    if ($allOwners) { $related->attachRelations($allOwners); }
+                }
             }
         }
         // reset eager-load request
         $this->with = [];
+        $this->withTree = [];
+        $this->withConstraints = [];
         // keep relationFields for potential subsequent relation loads within same high-level call
     }
 
@@ -452,5 +503,34 @@ abstract class AbstractMongoDao
     public function relationMap(): array
     {
         return $this->relations();
+    }
+
+    // ===== with()/nested helpers =====
+    private function insertRelationPath(array &$tree, string $path): void
+    {
+        $parts = array_values(array_filter(explode('.', $path), fn($p) => $p !== ''));
+        if (!$parts) return;
+        $level =& $tree;
+        foreach ($parts as $p) {
+            if (!isset($level[$p])) { $level[$p] = []; }
+            $level =& $level[$p];
+        }
+    }
+
+    private function rebuildNestedForChild(string $prefix, array $subtree): array
+    {
+        $out = [];
+        foreach ($subtree as $name => $child) {
+            $full = $prefix . '.' . $name;
+            if (isset($this->withConstraints[$full]) && is_callable($this->withConstraints[$full])) {
+                $out[$name] = $this->withConstraints[$full];
+            } else { $out[] = $name; }
+        }
+        return $out;
+    }
+
+    private function constraintForPath(string $path): mixed
+    {
+        return $this->withConstraints[$path] ?? null;
     }
 }

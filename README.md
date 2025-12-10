@@ -260,6 +260,88 @@ Notes:
 - Loaded relations are attached onto the DTO under the relation name (e.g., `$user->posts`).
 - `hasOne` is supported like `hasMany` but attaches a single DTO instead of a list.
 
+### belongsToMany (SQL) and pivot helpers
+
+Pairity supports many‑to‑many relations for SQL DAOs via a pivot table. Declare `belongsToMany` in your DAO’s `relations()` and use the built‑in pivot helpers `attach`, `detach`, and `sync`.
+
+Relation metadata keys:
+- `type` = `belongsToMany`
+- `dao` = related DAO class
+- `pivot` (or `pivotTable`) = pivot table name
+- `foreignPivotKey` = pivot column referencing the parent table
+- `relatedPivotKey` = pivot column referencing the related table
+- `localKey` = parent primary key column (default `id`)
+- `relatedKey` = related primary key column (default `id`)
+
+Example (users ↔ roles):
+
+```php
+class UserDao extends AbstractDao {
+    protected function relations(): array {
+        return [
+            'roles' => [
+                'type' => 'belongsToMany',
+                'dao'  => RoleDao::class,
+                'pivot' => 'user_role',
+                'foreignPivotKey' => 'user_id',
+                'relatedPivotKey' => 'role_id',
+                'localKey' => 'id',
+                'relatedKey' => 'id',
+            ],
+        ];
+    }
+}
+
+$user = $userDao->insert(['email' => 'a@b.com']);
+$uid = $user->toArray(false)['id'];
+$userDao->attach('roles', $uid, [$roleId1, $roleId2]); // insert into pivot
+$userDao->detach('roles', $uid, [$roleId1]);           // delete specific
+$userDao->sync('roles', $uid, [$roleId2]);             // make roles exactly this set
+
+$with = $userDao->with(['roles'])->findById($uid);     // eager load related roles
+```
+
+See `examples/mysql_relations_pivot.php` for a runnable snippet.
+
+### Nested eager loading
+
+You can request nested eager loading using dot notation. Example: load a user’s posts and each post’s comments:
+
+```php
+$users = $userDao->with(['posts.comments'])->findAllBy([...]);
+```
+
+Nested eager loading works for SQL and Mongo DAOs. Pairity performs separate batched fetches per relation level to remain portable across drivers.
+
+### Per‑relation constraints
+
+Pass a callable per relation path to customize how the related DAO queries data for that relation. The callable receives the related DAO instance so you can specify fields, ordering, and limits.
+
+- SQL example (per‑relation `fields()` projection and ordering):
+
+```php
+$users = $userDao->with([
+    'posts' => function (UserPostDao $dao) {
+        $dao->fields('id', 'title');
+        // $dao->orderBy('created_at DESC'); // if your DAO exposes ordering
+    },
+    'posts.comments' // nested
+])->findAllBy(['status' => 'active']);
+```
+
+- Mongo example (projection, sort, limit):
+
+```php
+$docs = $userMongoDao->with([
+    'posts' => function (PostMongoDao $dao) {
+        $dao->fields('title')->sort(['title' => 1])->limit(10);
+    },
+    'posts.comments'
+])->findAllBy([]);
+```
+
+Constraints are applied only to the specific relation path they are defined on.
+
 ## Model metadata & schema mapping (MVP)
 
 Define schema metadata on your DAO by overriding `schema()`. The schema enables:

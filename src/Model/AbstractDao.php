@@ -16,6 +16,20 @@ abstract class AbstractDao implements DaoInterface
     private array $relationFields = [];
     /** @var array<int,string> */
     private array $with = [];
+    /**
+     * Nested eager-loading tree built from with() calls.
+     * Example: with(['posts.comments','user']) =>
+     *   [ 'posts' => ['comments' => []], 'user' => [] ]
+     * @var array<string, array<string,mixed>>
+     */
+    private array $withTree = [];
+    /**
+     * Per relation (and nested path) constraints.
+     * Keys are relation paths like 'posts' or 'posts.comments'.
+     * Values are callables taking the related DAO instance.
+     * @var array<string, callable>
+     */
+    private array $withConstraints = [];
     /** Soft delete include flags */
     private bool $includeTrashed = false;
     private bool $onlyTrashed = false;
@@ -458,6 +472,11 @@ abstract class AbstractDao implements DaoInterface
 
             /** @var class-string<AbstractDao> $daoClass */
             $relatedDao = new $daoClass($this->getConnection());
+            // Apply per-relation constraint, if any
+            $constraint = $this->constraintForPath($name);
+            if (is_callable($constraint)) {
+                $constraint($relatedDao);
+            }
             $relFields = $this->relationFields[$name] ?? null;
             if ($relFields) { $relatedDao->fields(...$relFields); }
 
@@ -492,6 +511,28 @@ abstract class AbstractDao implements DaoInterface
                         $p->setRelation($name, $list);
                     }
                 }
+                // Nested eager for children of this relation
+                $nested = $this->withTree[$name] ?? [];
+                if ($nested) {
+                    // Flatten first-level child relation names for related DAO
+                    $childNames = array_keys($nested);
+                    // Prepare related DAO with child-level constraints (prefix path)
+                    $relatedDao->with($this->rebuildNestedForChild($name, $nested));
+                    // Collect all child DTOs (hasMany arrays concatenated; hasOne singletons filtered)
+                    $allChildren = [];
+                    foreach ($parents as $p) {
+                        $val = $p->toArray(false)[$name] ?? null;
+                        if ($val instanceof AbstractDto) {
+                            $allChildren[] = $val;
+                        } elseif (is_array($val)) {
+                            foreach ($val as $c) { if ($c instanceof AbstractDto) { $allChildren[] = $c; } }
+                        }
+                    }
+                    if ($allChildren) {
+                        // Call attachRelations on the related DAO to process its with list
+                        $relatedDao->attachRelations($allChildren);
+                    }
+                }
             } elseif ($type === 'belongsTo') {
                 $foreignKey = (string)($config['foreignKey'] ?? ''); // on parent
                 $otherKey = (string)($config['otherKey'] ?? 'id');    // on related
@@ -515,16 +556,204 @@ abstract class AbstractDao implements DaoInterface
                     $fk = $arr[$foreignKey] ?? null;
                     $p->setRelation($name, ($fk !== null && isset($byId[$fk])) ? $byId[$fk] : null);
                 }
+                // Nested eager for belongsTo owner
+                $nested = $this->withTree[$name] ?? [];
+                if ($nested) {
+                    $childNames = array_keys($nested);
+                    $relatedDao->with($this->rebuildNestedForChild($name, $nested));
+                    $allOwners = [];
+                    foreach ($parents as $p) {
+                        $val = $p->toArray(false)[$name] ?? null;
+                        if ($val instanceof AbstractDto) { $allOwners[] = $val; }
+                    }
+                    if ($allOwners) {
+                        $relatedDao->attachRelations($allOwners);
+                    }
+                }
+            } elseif ($type === 'belongsToMany') {
+                // SQL-only many-to-many via pivot table
+                $pivot = (string)($config['pivot'] ?? ($config['pivotTable'] ?? ''));
+                $foreignPivotKey = (string)($config['foreignPivotKey'] ?? ''); // pivot column referencing parent
+                $relatedPivotKey = (string)($config['relatedPivotKey'] ?? ''); // pivot column referencing related
+                $localKey = (string)($config['localKey'] ?? 'id');            // on parent
+                $relatedKey = (string)($config['relatedKey'] ?? 'id');        // on related
+                if ($pivot === '' || $foreignPivotKey === '' || $relatedPivotKey === '') { continue; }
+
+                // Collect parent keys
+                $parentKeys = [];
+                foreach ($parents as $p) {
+                    $arr = $p->toArray(false);
+                    if (isset($arr[$localKey])) { $parentKeys[] = $arr[$localKey]; }
+                }
+                if (!$parentKeys) continue;
+
+                // Fetch pivot rows
+                $ph = [];$bind=[];foreach (array_values(array_unique($parentKeys, SORT_REGULAR)) as $i=>$val){$k="p_$i";$ph[]=":$k";$bind[$k]=$val;}
+                $pivotSql = 'SELECT ' . $foreignPivotKey . ' AS fk, ' . $relatedPivotKey . ' AS rk FROM ' . $pivot . ' WHERE ' . $foreignPivotKey . ' IN (' . implode(', ', $ph) . ')';
+                $rows = $this->connection->query($pivotSql, $bind);
+                if (!$rows) {
+                    foreach ($parents as $p) { $p->setRelation($name, []); }
+                    continue;
+                }
+                $byParent = [];
+                $relatedIds = [];
+                foreach ($rows as $r) {
+                    $fkVal = $r['fk'] ?? null; $rkVal = $r['rk'] ?? null;
+                    if ($fkVal === null || $rkVal === null) continue;
+                    $byParent[(string)$fkVal][] = $rkVal;
+                    $relatedIds[] = $rkVal;
+                }
+                if (!$relatedIds) {
+                    foreach ($parents as $p) { $p->setRelation($name, []); }
+                    continue;
+                }
+                $relatedIds = array_values(array_unique($relatedIds, SORT_REGULAR));
+                // Apply constraints if provided
+                $constraint = $this->constraintForPath($name);
+                if (is_callable($constraint)) { $constraint($relatedDao); }
+                $related = $relatedDao->findAllWhereIn($relatedKey, $relatedIds);
+                $relatedMap = [];
+                foreach ($related as $r) {
+                    $id = $r->toArray(false)[$relatedKey] ?? null;
+                    if ($id !== null) { $relatedMap[(string)$id] = $r; }
+                }
+                foreach ($parents as $p) {
+                    $arr = $p->toArray(false);
+                    $lk = $arr[$localKey] ?? null;
+                    $ids = ($lk !== null && isset($byParent[(string)$lk])) ? $byParent[(string)$lk] : [];
+                    $attached = [];
+                    foreach ($ids as $rid) { if (isset($relatedMap[(string)$rid])) { $attached[] = $relatedMap[(string)$rid]; } }
+                    $p->setRelation($name, $attached);
+                }
+
+                // Nested eager on related side
+                $nested = $this->withTree[$name] ?? [];
+                if ($nested && !empty($related)) {
+                    $relatedDao->with($this->rebuildNestedForChild($name, $nested));
+                    $relatedDao->attachRelations($related);
+                }
             }
         }
         // reset eager-load request after use
         $this->with = [];
+        $this->withTree = [];
+        $this->withConstraints = [];
         // do not reset relationFields here; they may be reused by subsequent loads in the same call
+    }
+
+    // ===== belongsToMany helpers (pivot operations) =====
+
+    /**
+     * Attach related ids to a parent for a belongsToMany relation.
+     * Returns number of rows inserted into the pivot table.
+     * @param string $relationName
+     * @param int|string $parentId
+     * @param array<int,int|string> $relatedIds
+     */
+    public function attach(string $relationName, int|string $parentId, array $relatedIds): int
+    {
+        if (!$relatedIds) return 0;
+        $cfg = $this->relations()[$relationName] ?? null;
+        if (!is_array($cfg) || ($cfg['type'] ?? '') !== 'belongsToMany') {
+            throw new \InvalidArgumentException("Relation '{$relationName}' is not a belongsToMany relation");
+        }
+        $pivot = (string)($cfg['pivot'] ?? ($cfg['pivotTable'] ?? ''));
+        $fk = (string)($cfg['foreignPivotKey'] ?? '');
+        $rk = (string)($cfg['relatedPivotKey'] ?? '');
+        if ($pivot === '' || $fk === '' || $rk === '') {
+            throw new \InvalidArgumentException("belongsToMany relation '{$relationName}' requires pivot, foreignPivotKey, relatedPivotKey");
+        }
+        $cols = [$fk, $rk];
+        $valuesSql = [];
+        $params = [];
+        foreach (array_values(array_unique($relatedIds, SORT_REGULAR)) as $i => $rid) {
+            $p1 = "p_fk_{$i}"; $p2 = "p_rk_{$i}";
+            $valuesSql[] = '(:' . $p1 . ', :' . $p2 . ')';
+            $params[$p1] = $parentId;
+            $params[$p2] = $rid;
+        }
+        $sql = 'INSERT INTO ' . $pivot . ' (' . implode(', ', $cols) . ') VALUES ' . implode(', ', $valuesSql);
+        return $this->connection->execute($sql, $params);
+    }
+
+    /**
+     * Detach related ids from a parent for a belongsToMany relation. If $relatedIds is empty, detaches all.
+     * Returns affected rows.
+     * @param array<int,int|string> $relatedIds
+     */
+    public function detach(string $relationName, int|string $parentId, array $relatedIds = []): int
+    {
+        $cfg = $this->relations()[$relationName] ?? null;
+        if (!is_array($cfg) || ($cfg['type'] ?? '') !== 'belongsToMany') {
+            throw new \InvalidArgumentException("Relation '{$relationName}' is not a belongsToMany relation");
+        }
+        $pivot = (string)($cfg['pivot'] ?? ($cfg['pivotTable'] ?? ''));
+        $fk = (string)($cfg['foreignPivotKey'] ?? '');
+        $rk = (string)($cfg['relatedPivotKey'] ?? '');
+        if ($pivot === '' || $fk === '' || $rk === '') {
+            throw new \InvalidArgumentException("belongsToMany relation '{$relationName}' requires pivot, foreignPivotKey, relatedPivotKey");
+        }
+        $where = $fk . ' = :pid';
+        $params = ['pid' => $parentId];
+        if ($relatedIds) {
+            $ph = [];
+            foreach (array_values(array_unique($relatedIds, SORT_REGULAR)) as $i => $rid) { $k = "r_$i"; $ph[] = ":$k"; $params[$k] = $rid; }
+            $where .= ' AND ' . $rk . ' IN (' . implode(', ', $ph) . ')';
+        }
+        $sql = 'DELETE FROM ' . $pivot . ' WHERE ' . $where;
+        return $this->connection->execute($sql, $params);
+    }
+
+    /**
+     * Sync the related ids set for a parent: attach missing, detach extra.
+     * Returns ['attached' => int, 'detached' => int].
+     * @param array<int,int|string> $relatedIds
+     * @return array{attached:int,detached:int}
+     */
+    public function sync(string $relationName, int|string $parentId, array $relatedIds): array
+    {
+        $cfg = $this->relations()[$relationName] ?? null;
+        if (!is_array($cfg) || ($cfg['type'] ?? '') !== 'belongsToMany') {
+            throw new \InvalidArgumentException("Relation '{$relationName}' is not a belongsToMany relation");
+        }
+        $pivot = (string)($cfg['pivot'] ?? ($cfg['pivotTable'] ?? ''));
+        $fk = (string)($cfg['foreignPivotKey'] ?? '');
+        $rk = (string)($cfg['relatedPivotKey'] ?? '');
+        if ($pivot === '' || $fk === '' || $rk === '') {
+            throw new \InvalidArgumentException("belongsToMany relation '{$relationName}' requires pivot, foreignPivotKey, relatedPivotKey");
+        }
+        // Read current related ids
+        $rows = $this->connection->query('SELECT ' . $rk . ' AS rk FROM ' . $pivot . ' WHERE ' . $fk . ' = :pid', ['pid' => $parentId]);
+        $current = [];
+        foreach ($rows as $r) { $v = $r['rk'] ?? null; if ($v !== null) { $current[(string)$v] = true; } }
+        $target = [];
+        foreach (array_values(array_unique($relatedIds, SORT_REGULAR)) as $v) { $target[(string)$v] = true; }
+        $toAttach = array_diff_key($target, $current);
+        $toDetach = array_diff_key($current, $target);
+        $attached = $toAttach ? $this->attach($relationName, $parentId, array_keys($toAttach)) : 0;
+        $detached = $toDetach ? $this->detach($relationName, $parentId, array_keys($toDetach)) : 0;
+        return ['attached' => (int)$attached, 'detached' => (int)$detached];
     }
 
     public function with(array $relations): static
     {
-        $this->with = $relations;
+        // Accept ['rel', 'rel.child'] or ['rel' => callable, 'rel.child' => callable]
+        $names = [];
+        $tree = [];
+        foreach ($relations as $key => $value) {
+            if (is_int($key)) { // plain name
+                $path = (string)$value;
+                $this->insertRelationPath($tree, $path);
+            } else { // constraint
+                $path = (string)$key;
+                if (is_callable($value)) {
+                    $this->withConstraints[$path] = $value;
+                }
+                $this->insertRelationPath($tree, $path);
+            }
+        }
+        $this->withTree = $tree;
+        $this->with = array_keys($tree); // first-level only
         return $this;
     }
 
@@ -573,6 +802,40 @@ abstract class AbstractDao implements DaoInterface
         $this->relationFields = [];
         $this->includeTrashed = false;
         $this->onlyTrashed = false;
+    }
+
+    // ===== with()/nested helpers =====
+
+    private function insertRelationPath(array &$tree, string $path): void
+    {
+        $parts = array_values(array_filter(explode('.', $path), fn($p) => $p !== ''));
+        if (!$parts) return;
+        $level =& $tree;
+        foreach ($parts as $i => $p) {
+            if (!isset($level[$p])) { $level[$p] = []; }
+            $level =& $level[$p];
+        }
+    }
+
+    /** Build child-level with() array (flattened) for a nested subtree, preserving constraints under full paths. */
+    private function rebuildNestedForChild(string $prefix, array $subtree): array
+    {
+        $out = [];
+        foreach ($subtree as $name => $child) {
+            $full = $prefix . '.' . $name;
+            // include with constraint if exists
+            if (isset($this->withConstraints[$full]) && is_callable($this->withConstraints[$full])) {
+                $out[$name] = $this->withConstraints[$full];
+            } else {
+                $out[] = $name;
+            }
+        }
+        return $out;
+    }
+
+    private function constraintForPath(string $path): mixed
+    {
+        return $this->withConstraints[$path] ?? null;
     }
 
     // ===== Schema helpers & behaviors =====
