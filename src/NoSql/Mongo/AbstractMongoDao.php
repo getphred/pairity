@@ -158,7 +158,12 @@ abstract class AbstractMongoDao
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id; $payload = $data;
-            $uow->enqueue($conn, function () use ($self, $theId, $payload) {
+            $uow->enqueueWithMeta($conn, [
+                'type' => 'update',
+                'mode' => 'byId',
+                'dao'  => $this,
+                'id'   => (string)$id,
+            ], function () use ($self, $theId, $payload) {
                 UnitOfWork::suspendDuring(function () use ($self, $theId, $payload) {
                     $self->getConnection()->updateOne($self->databaseName(), $self->collection(), ['_id' => $theId], ['$set' => $payload]);
                 });
@@ -176,7 +181,12 @@ abstract class AbstractMongoDao
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id;
-            $uow->enqueue($conn, function () use ($self, $theId) {
+            $uow->enqueueWithMeta($conn, [
+                'type' => 'delete',
+                'mode' => 'byId',
+                'dao'  => $this,
+                'id'   => (string)$id,
+            ], function () use ($self, $theId) {
                 UnitOfWork::suspendDuring(function () use ($self, $theId) {
                     $self->getConnection()->deleteOne($self->databaseName(), $self->collection(), ['_id' => $theId]);
                 });
@@ -192,7 +202,12 @@ abstract class AbstractMongoDao
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $flt = $this->normalizeFilterInput($filter);
-            $uow->enqueue($conn, function () use ($self, $flt) {
+            $uow->enqueueWithMeta($conn, [
+                'type' => 'delete',
+                'mode' => 'byCriteria',
+                'dao'  => $this,
+                'criteria' => $flt,
+            ], function () use ($self, $flt) {
                 UnitOfWork::suspendDuring(function () use ($self, $flt) {
                     $self->getConnection()->deleteOne($self->databaseName(), $self->collection(), $flt);
                 });
@@ -431,5 +446,11 @@ abstract class AbstractMongoDao
         // reset eager-load request
         $this->with = [];
         // keep relationFields for potential subsequent relation loads within same high-level call
+    }
+
+    /** Expose relation metadata for UoW ordering/cascades. */
+    public function relationMap(): array
+    {
+        return $this->relations();
     }
 }

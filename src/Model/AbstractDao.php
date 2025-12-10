@@ -154,7 +154,12 @@ abstract class AbstractDao implements DaoInterface
             $toStore = $this->prepareForUpdate($data);
             $self = $this;
             $conn = $this->connection;
-            $uow->enqueue($conn, function () use ($self, $id, $toStore) {
+            $uow->enqueueWithMeta($conn, [
+                'type' => 'update',
+                'mode' => 'byId',
+                'dao'  => $this,
+                'id'   => (string)$id,
+            ], function () use ($self, $id, $toStore) {
                 UnitOfWork::suspendDuring(function () use ($self, $id, $toStore) {
                     // execute real update now
                     $sets = [];
@@ -202,7 +207,12 @@ abstract class AbstractDao implements DaoInterface
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id;
-            $uow->enqueue($conn, function () use ($self, $theId) {
+            $uow->enqueueWithMeta($conn, [
+                'type' => 'delete',
+                'mode' => 'byId',
+                'dao'  => $this,
+                'id'   => (string)$id,
+            ], function () use ($self, $theId) {
                 UnitOfWork::suspendDuring(function () use ($self, $theId) { $self->deleteById($theId); });
             });
             // deferred; immediate affected count unknown
@@ -225,7 +235,12 @@ abstract class AbstractDao implements DaoInterface
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $crit = $criteria;
-            $uow->enqueue($conn, function () use ($self, $crit) {
+            $uow->enqueueWithMeta($conn, [
+                'type' => 'delete',
+                'mode' => 'byCriteria',
+                'dao'  => $this,
+                'criteria' => $criteria,
+            ], function () use ($self, $crit) {
                 UnitOfWork::suspendDuring(function () use ($self, $crit) { $self->deleteBy($crit); });
             });
             return 0;
@@ -258,7 +273,12 @@ abstract class AbstractDao implements DaoInterface
         if ($uow && !UnitOfWork::isSuspended()) {
             if (empty($data)) { return 0; }
             $self = $this; $conn = $this->connection; $crit = $criteria; $payload = $this->prepareForUpdate($data);
-            $uow->enqueue($conn, function () use ($self, $crit, $payload) {
+            $uow->enqueueWithMeta($conn, [
+                'type' => 'update',
+                'mode' => 'byCriteria',
+                'dao'  => $this,
+                'criteria' => $criteria,
+            ], function () use ($self, $crit, $payload) {
                 UnitOfWork::suspendDuring(function () use ($self, $crit, $payload) { $self->updateBy($crit, $payload); });
             });
             // unknown affected rows until commit
@@ -282,6 +302,12 @@ abstract class AbstractDao implements DaoInterface
 
         $sql = 'UPDATE ' . $this->getTable() . ' SET ' . implode(', ', $sets) . ' WHERE ' . $where;
         return $this->connection->execute($sql, array_merge($setParams, $whereBindings));
+    }
+
+    /** Expose relation metadata for UoW ordering/cascades. */
+    public function relationMap(): array
+    {
+        return $this->relations();
     }
 
     /**
