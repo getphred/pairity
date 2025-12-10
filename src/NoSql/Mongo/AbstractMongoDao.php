@@ -37,6 +37,12 @@ abstract class AbstractMongoDao
     /** @var array<string, array<int,string>> */
     private array $relationFields = [];
 
+    /** Scopes (MVP) */
+    /** @var array<int, callable> */
+    private array $runtimeScopes = [];
+    /** @var array<string, callable> */
+    private array $namedScopes = [];
+
     public function __construct(MongoConnectionInterface $connection)
     {
         $this->connection = $connection;
@@ -114,10 +120,13 @@ abstract class AbstractMongoDao
     /** @param array<string,mixed>|Filter $filter */
     public function findOneBy(array|Filter $filter): ?AbstractDto
     {
+        $filterArr = $this->normalizeFilterInput($filter);
+        $this->applyRuntimeScopesToFilter($filterArr);
         $opts = $this->buildOptions();
         $opts['limit'] = 1;
-        $docs = $this->connection->find($this->databaseName(), $this->collection(), $this->normalizeFilterInput($filter), $opts);
+        $docs = $this->connection->find($this->databaseName(), $this->collection(), $filterArr, $opts);
         $this->resetModifiers();
+        $this->resetRuntimeScopes();
         $row = $docs[0] ?? null;
         return $row ? $this->hydrate($row) : null;
     }
@@ -129,15 +138,18 @@ abstract class AbstractMongoDao
      */
     public function findAllBy(array|Filter $filter = [], array $options = []): array
     {
+        $filterArr = $this->normalizeFilterInput($filter);
+        $this->applyRuntimeScopesToFilter($filterArr);
         $opts = $this->buildOptions();
         // external override/merge
         foreach ($options as $k => $v) { $opts[$k] = $v; }
-        $docs = $this->connection->find($this->databaseName(), $this->collection(), $this->normalizeFilterInput($filter), $opts);
+        $docs = $this->connection->find($this->databaseName(), $this->collection(), $filterArr, $opts);
         $dtos = array_map(fn($d) => $this->hydrate($d), is_iterable($docs) ? $docs : []);
         if ($dtos && $this->with) {
             $this->attachRelations($dtos);
         }
         $this->resetModifiers();
+        $this->resetRuntimeScopes();
         return $dtos;
     }
 
@@ -226,7 +238,11 @@ abstract class AbstractMongoDao
             return 0;
         }
         // For MVP provide deleteOne semantic; bulk deletes could be added later
-        return $this->connection->deleteOne($this->databaseName(), $this->collection(), $this->normalizeFilterInput($filter));
+        $flt = $this->normalizeFilterInput($filter);
+        $this->applyRuntimeScopesToFilter($flt);
+        $res = $this->connection->deleteOne($this->databaseName(), $this->collection(), $flt);
+        $this->resetRuntimeScopes();
+        return $res;
     }
 
     /** Upsert by id convenience. */
@@ -252,8 +268,10 @@ abstract class AbstractMongoDao
         if (!$values) return [];
         // Normalize values (unique)
         $values = array_values(array_unique($values));
+        $filter = [ $field => ['$in' => $values] ];
+        $this->applyRuntimeScopesToFilter($filter);
         $opts = $this->buildOptions();
-        $docs = $this->connection->find($this->databaseName(), $this->collection(), [ $field => ['$in' => $values] ], $opts);
+        $docs = $this->connection->find($this->databaseName(), $this->collection(), $filter, $opts);
         return array_map(fn($d) => $this->hydrate($d), is_iterable($docs) ? $docs : []);
     }
 
@@ -283,6 +301,14 @@ abstract class AbstractMongoDao
                 case 'deleteBy':
                     return $this->deleteBy([$col => $arguments[0] ?? null]);
             }
+        }
+        // Named scope invocation
+        if (isset($this->namedScopes[$name]) && is_callable($this->namedScopes[$name])) {
+            $callable = $this->namedScopes[$name];
+            $this->runtimeScopes[] = function (&$filter) use ($callable, $arguments) {
+                $callable($filter, ...$arguments);
+            };
+            return $this;
         }
         throw new \BadMethodCallException(static::class . "::{$name} does not exist");
     }
@@ -336,6 +362,74 @@ abstract class AbstractMongoDao
         if ($this->limitVal !== null) { $opts['limit'] = $this->limitVal; }
         if ($this->skipVal !== null) { $opts['skip'] = $this->skipVal; }
         return $opts;
+    }
+
+    /**
+     * Paginate results.
+     * @return array{data:array<int,AbstractDto>,total:int,perPage:int,currentPage:int,lastPage:int}
+     */
+    public function paginate(int $page, int $perPage = 15, array|Filter $filter = []): array
+    {
+        $page = max(1, $page);
+        $perPage = max(1, $perPage);
+
+        $flt = $this->normalizeFilterInput($filter);
+        $this->applyRuntimeScopesToFilter($flt);
+
+        // Total via aggregation count
+        $pipeline = [];
+        if (!empty($flt)) { $pipeline[] = ['$match' => $flt]; }
+        $pipeline[] = ['$count' => 'cnt'];
+        $agg = $this->connection->aggregate($this->databaseName(), $this->collection(), $pipeline, []);
+        $arr = is_iterable($agg) ? iterator_to_array($agg, false) : (array)$agg;
+        $total = (int)($arr[0]['cnt'] ?? 0);
+
+        // Page data
+        $opts = $this->buildOptions();
+        $opts['limit'] = $perPage;
+        $opts['skip'] = ($page - 1) * $perPage;
+        $docs = $this->connection->find($this->databaseName(), $this->collection(), $flt, $opts);
+        $dtos = array_map(fn($d) => $this->hydrate($d), is_iterable($docs) ? $docs : []);
+        if ($dtos && $this->with) { $this->attachRelations($dtos); }
+        $this->resetModifiers();
+        $this->resetRuntimeScopes();
+
+        $lastPage = (int)max(1, (int)ceil($total / $perPage));
+        return [
+            'data' => $dtos,
+            'total' => $total,
+            'perPage' => $perPage,
+            'currentPage' => $page,
+            'lastPage' => $lastPage,
+        ];
+    }
+
+    /** Simple pagination without total; returns nextPage if more likely exists. */
+    public function simplePaginate(int $page, int $perPage = 15, array|Filter $filter = []): array
+    {
+        $page = max(1, $page);
+        $perPage = max(1, $perPage);
+        $flt = $this->normalizeFilterInput($filter);
+        $this->applyRuntimeScopesToFilter($flt);
+
+        $opts = $this->buildOptions();
+        $opts['limit'] = $perPage + 1; // fetch one extra
+        $opts['skip'] = ($page - 1) * $perPage;
+        $docs = $this->connection->find($this->databaseName(), $this->collection(), $flt, $opts);
+        $docsArr = is_iterable($docs) ? iterator_to_array($docs, false) : (array)$docs;
+        $hasMore = count($docsArr) > $perPage;
+        if ($hasMore) { array_pop($docsArr); }
+        $dtos = array_map(fn($d) => $this->hydrate($d), $docsArr);
+        if ($dtos && $this->with) { $this->attachRelations($dtos); }
+        $this->resetModifiers();
+        $this->resetRuntimeScopes();
+
+        return [
+            'data' => $dtos,
+            'perPage' => $perPage,
+            'currentPage' => $page,
+            'nextPage' => $hasMore ? $page + 1 : null,
+        ];
     }
 
     private function resetModifiers(): void
@@ -532,5 +626,34 @@ abstract class AbstractMongoDao
     private function constraintForPath(string $path): mixed
     {
         return $this->withConstraints[$path] ?? null;
+    }
+
+    // ===== Scopes (MVP) =====
+    /** Register a named scope callable: function(array &$filter, ...$args): void */
+    public function registerScope(string $name, callable $fn): static
+    {
+        $this->namedScopes[$name] = $fn;
+        return $this;
+    }
+
+    /** Add an ad-hoc scope callable(array &$filter): void for next query. */
+    public function scope(callable $fn): static
+    {
+        $this->runtimeScopes[] = $fn;
+        return $this;
+    }
+
+    /** @param array<string,mixed> $filter */
+    private function applyRuntimeScopesToFilter(array &$filter): void
+    {
+        if (!$this->runtimeScopes) return;
+        foreach ($this->runtimeScopes as $fn) {
+            try { $fn($filter); } catch (\Throwable) {}
+        }
+    }
+
+    private function resetRuntimeScopes(): void
+    {
+        $this->runtimeScopes = [];
     }
 }

@@ -33,6 +33,10 @@ abstract class AbstractDao implements DaoInterface
     /** Soft delete include flags */
     private bool $includeTrashed = false;
     private bool $onlyTrashed = false;
+    /** @var array<int, callable> */
+    private array $runtimeScopes = [];
+    /** @var array<string, callable> */
+    private array $namedScopes = [];
 
     public function __construct(ConnectionInterface $connection)
     {
@@ -93,7 +97,9 @@ abstract class AbstractDao implements DaoInterface
     /** @param array<string,mixed> $criteria */
     public function findOneBy(array $criteria): ?AbstractDto
     {
-        [$where, $bindings] = $this->buildWhere($this->applyDefaultScopes($criteria));
+        $criteria = $this->applyDefaultScopes($criteria);
+        $this->applyRuntimeScopesToCriteria($criteria);
+        [$where, $bindings] = $this->buildWhere($criteria);
         $where = $this->appendScopedWhere($where);
         $sql = 'SELECT ' . $this->selectList() . ' FROM ' . $this->getTable() . ($where ? ' WHERE ' . $where : '') . ' LIMIT 1';
         $rows = $this->connection->query($sql, $bindings);
@@ -102,6 +108,7 @@ abstract class AbstractDao implements DaoInterface
             $this->attachRelations([$dto]);
         }
         $this->resetFieldSelections();
+        $this->resetRuntimeScopes();
         return $dto;
     }
 
@@ -123,7 +130,9 @@ abstract class AbstractDao implements DaoInterface
      */
     public function findAllBy(array $criteria = []): array
     {
-        [$where, $bindings] = $this->buildWhere($this->applyDefaultScopes($criteria));
+        $criteria = $this->applyDefaultScopes($criteria);
+        $this->applyRuntimeScopesToCriteria($criteria);
+        [$where, $bindings] = $this->buildWhere($criteria);
         $where = $this->appendScopedWhere($where);
         $sql = 'SELECT ' . $this->selectList() . ' FROM ' . $this->getTable() . ($where ? ' WHERE ' . $where : '');
         $rows = $this->connection->query($sql, $bindings);
@@ -132,7 +141,81 @@ abstract class AbstractDao implements DaoInterface
             $this->attachRelations($dtos);
         }
         $this->resetFieldSelections();
+        $this->resetRuntimeScopes();
         return $dtos;
+    }
+
+    /**
+     * Paginate results for the given criteria.
+     * @return array{data:array<int,AbstractDto>,total:int,perPage:int,currentPage:int,lastPage:int}
+     */
+    public function paginate(int $page, int $perPage = 15, array $criteria = []): array
+    {
+        $page = max(1, $page);
+        $perPage = max(1, $perPage);
+
+        $criteria = $this->applyDefaultScopes($criteria);
+        $this->applyRuntimeScopesToCriteria($criteria);
+        [$where, $bindings] = $this->buildWhere($criteria);
+        $whereFinal = $this->appendScopedWhere($where);
+
+        // Total
+        $countSql = 'SELECT COUNT(*) AS cnt FROM ' . $this->getTable() . ($whereFinal ? ' WHERE ' . $whereFinal : '');
+        $countRows = $this->connection->query($countSql, $bindings);
+        $total = (int)($countRows[0]['cnt'] ?? 0);
+
+        // Page data
+        $offset = ($page - 1) * $perPage;
+        $dataSql = 'SELECT ' . $this->selectList() . ' FROM ' . $this->getTable()
+            . ($whereFinal ? ' WHERE ' . $whereFinal : '')
+            . ' LIMIT ' . $perPage . ' OFFSET ' . $offset;
+        $rows = $this->connection->query($dataSql, $bindings);
+        $dtos = array_map(fn($r) => $this->hydrate($this->castRowFromStorage($r)), $rows);
+        if ($dtos && $this->with) {
+            $this->attachRelations($dtos);
+        }
+        $this->resetFieldSelections();
+        $this->resetRuntimeScopes();
+
+        $lastPage = (int)max(1, (int)ceil($total / $perPage));
+        return [
+            'data' => $dtos,
+            'total' => $total,
+            'perPage' => $perPage,
+            'currentPage' => $page,
+            'lastPage' => $lastPage,
+        ];
+    }
+
+    /** Simple pagination without total count. Returns nextPage if there might be more. */
+    public function simplePaginate(int $page, int $perPage = 15, array $criteria = []): array
+    {
+        $page = max(1, $page);
+        $perPage = max(1, $perPage);
+
+        $criteria = $this->applyDefaultScopes($criteria);
+        $this->applyRuntimeScopesToCriteria($criteria);
+        [$where, $bindings] = $this->buildWhere($criteria);
+        $whereFinal = $this->appendScopedWhere($where);
+
+        $offset = ($page - 1) * $perPage;
+        $sql = 'SELECT ' . $this->selectList() . ' FROM ' . $this->getTable()
+            . ($whereFinal ? ' WHERE ' . $whereFinal : '')
+            . ' LIMIT ' . ($perPage + 1) . ' OFFSET ' . $offset; // fetch one extra to detect more
+        $rows = $this->connection->query($sql, $bindings);
+        $hasMore = count($rows) > $perPage;
+        if ($hasMore) { array_pop($rows); }
+        $dtos = array_map(fn($r) => $this->hydrate($this->castRowFromStorage($r)), $rows);
+        if ($dtos && $this->with) { $this->attachRelations($dtos); }
+        $this->resetFieldSelections();
+        $this->resetRuntimeScopes();
+
+        return [
+            'data' => $dtos,
+            'perPage' => $perPage,
+            'currentPage' => $page,
+            'nextPage' => $hasMore ? $page + 1 : null,
+        ];
     }
 
     /** @param array<string,mixed> $data */
@@ -420,6 +503,16 @@ abstract class AbstractDao implements DaoInterface
             }
         }
 
+        // Named scope call support: if a scope is registered with this method name, queue it and return $this
+        if (isset($this->namedScopes[$name]) && is_callable($this->namedScopes[$name])) {
+            $callable = $this->namedScopes[$name];
+            // Bind arguments
+            $this->runtimeScopes[] = function (&$criteria) use ($callable, $arguments) {
+                $callable($criteria, ...$arguments);
+            };
+            return $this;
+        }
+
         throw new \BadMethodCallException(static::class . "::{$name} does not exist");
     }
 
@@ -428,6 +521,36 @@ abstract class AbstractDao implements DaoInterface
         // Convert StudlyCase/CamelCase to snake_case and lowercase
         $snake = preg_replace('/(?<!^)[A-Z]/', '_$0', $studly) ?? $studly;
         return strtolower($snake);
+    }
+
+    // ===== Scopes (MVP) =====
+
+    /** Register a named scope callable: function(array &$criteria, ...$args): void */
+    public function registerScope(string $name, callable $fn): static
+    {
+        $this->namedScopes[$name] = $fn;
+        return $this;
+    }
+
+    /** Add an ad-hoc scope for the next query: callable(array &$criteria): void */
+    public function scope(callable $fn): static
+    {
+        $this->runtimeScopes[] = $fn;
+        return $this;
+    }
+
+    /** @param array<string,mixed> $criteria */
+    private function applyRuntimeScopesToCriteria(array &$criteria): void
+    {
+        if (!$this->runtimeScopes) return;
+        foreach ($this->runtimeScopes as $fn) {
+            try { $fn($criteria); } catch (\Throwable) {}
+        }
+    }
+
+    private function resetRuntimeScopes(): void
+    {
+        $this->runtimeScopes = [];
     }
 
     /**

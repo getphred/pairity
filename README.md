@@ -578,6 +578,79 @@ $deep    = array_map(fn($u) => $u->toArray(), $users);       // deep (default)
 $shallow = array_map(fn($u) => $u->toArray(false), $users);  // shallow
 ```
 
+## Pagination
+
+Both SQL and Mongo DAOs provide pagination helpers that return DTOs alongside metadata. They honor the usual query modifiers:
+
+- SQL: `fields()`, `with([...])` (eager load)
+- Mongo: `fields()` (projection), `sort()`, `with([...])`
+
+Methods and return shapes:
+
+```php
+// SQL
+/** @return array{data: array<int, DTO>, total: int, perPage: int, currentPage: int, lastPage: int} */
+$page = $userDao->paginate(page: 2, perPage: 10, criteria: ['status' => 'active']);
+
+/** @return array{data: array<int, DTO>, perPage: int, currentPage: int, nextPage: int|null} */
+$simple = $userDao->simplePaginate(page: 1, perPage: 10, criteria: []);
+
+// Mongo
+$page = $userMongoDao->paginate(2, 10, /* filter */ []);
+$simple = $userMongoDao->simplePaginate(1, 10, /* filter */ []);
+```
+
+Example (SQL + SQLite):
+
+```php
+$page1 = (new UserDao($conn))->paginate(1, 10);            // total + lastPage included
+$sp    = (new UserDao($conn))->simplePaginate(1, 10);       // no total; nextPage detection
+
+// With projection and eager loading
+$with  = (new UserDao($conn))
+    ->fields('id','email','posts.title')
+    ->with(['posts'])
+    ->paginate(1, 5);
+```
+
+Example (Mongo):
+
+```php
+$with = (new UserMongoDao($mongo))
+    ->fields('email','posts.title')
+    ->sort(['email' => 1])
+    ->with(['posts'])
+    ->paginate(1, 10, []);
+```
+
+See examples: `examples/sqlite_pagination.php` and `examples/nosql/mongo_pagination.php`.
+
+## Query Scopes (MVP)
+
+Define small, reusable filters using scopes. Scopes are reset after each `find*`/`paginate*` call.
+
+- Ad‑hoc scope: `scope(callable $fn)` where `$fn` mutates the criteria/filter array for the next query.
+- Named scopes: `registerScope('name', fn (&$criteria, ...$args) => ...)` and then call `$dao->name(...$args)` before `find*`/`paginate*`.
+
+SQL example:
+
+```php
+$userDao->registerScope('active', function (&$criteria) { $criteria['status'] = 'active'; });
+
+$active = $userDao->active()->paginate(1, 50);
+
+// Combine with ad‑hoc scope
+$inactive = $userDao->scope(function (&$criteria) { $criteria['status'] = 'inactive'; })
+                   ->findAllBy();
+```
+
+Mongo example (filter scopes):
+
+```php
+$userMongoDao->registerScope('active', function (&$filter) { $filter['status'] = 'active'; });
+$page = $userMongoDao->active()->paginate(1, 25, []);
+```
+
 ## Unit of Work (opt-in)
 
 Pairity offers an optional Unit of Work (UoW) that you can enable per block to batch and order mutations atomically, while keeping the familiar DAO/DTO API.
