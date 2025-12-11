@@ -2,6 +2,9 @@
 
 A partitioned‑model PHP ORM (DTO/DAO) with Query Builder, relations, raw SQL helpers, and a portable migrations + schema builder. Namespace: `Pairity\`. Package: `getphred/pairity`.
 
+![CI](https://github.com/getphred/pairity/actions/workflows/ci.yml/badge.svg)
+![Packagist](https://img.shields.io/packagist/v/getphred/pairity.svg)
+
 ## Contributing
 
 This is an early foundation. Contributions, discussions, and design proposals are welcome. Please open an issue to coordinate larger features.

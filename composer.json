@@ -1,11 +1,42 @@
 {
   "name": "getphred/pairity",
-  "description": "Partitioned-model PHP ORM (DTO/DAO), Query Builder, Raw SQL, multi-DB via PDO.",
+  "description": "DAO/DTO-centric PHP ORM with Query Builder, relations (SQL + MongoDB), migrations/CLI, Unit of Work, and event system. Supports MySQL/MariaDB, PostgreSQL, SQLite, SQL Server, Oracle, and MongoDB.",
   "type": "library",
   "license": "MIT",
   "authors": [
-    { "name": "Pairity Contributors" }
+    {
+      "name": "Phred",
+      "email": "phred@getphred.com",
+      "homepage": "https://getphred.com",
+      "role": "Owner"
+    }
   ],
+  "keywords": [
+    "php",
+    "orm",
+    "dao",
+    "dto",
+    "query builder",
+    "migrations",
+    "schema builder",
+    "relations",
+    "unit of work",
+    "events",
+    "pdo",
+    "mysql",
+    "mariadb",
+    "postgresql",
+    "sqlite",
+    "sqlserver",
+    "oracle",
+    "mongodb",
+    "nosql"
+  ],
+  "homepage": "https://github.com/getphred/pairity",
+  "support": {
+    "issues": "https://github.com/getphred/pairity/issues",
+    "source": "https://github.com/getphred/pairity"
+  },
   "require": {
     "php": ">=8.1",
     "ext-mongodb": "*",
