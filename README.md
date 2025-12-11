@@ -24,6 +24,38 @@ composer require getphred/pairity
 
 After install, you can use the CLI at `vendor/bin/pairity`.
 
+## Testing
+
+This project uses PHPUnit 10. The default test suite excludes MongoDB integration tests by default for portability.
+
+- Install dev dependencies:
+
+```
+composer install
+```
+
+- Run the default suite (SQLite + unit tests; Mongo tests excluded by default):
+
+```
+vendor/bin/phpunit
+```
+
+- Run MongoDB integration tests (requires `ext-mongodb >= 2.1` and a reachable server):
+  - Provide connection via environment variables and include the group:
+
+```
+MONGO_HOST=127.0.0.1 MONGO_PORT=27017 \
+vendor/bin/phpunit --group mongo-integration
+```
+
+Notes:
+- When Mongo is unavailable or the extension is missing, Mongo tests will self‑skip.
+- PostgreSQL smoke test requires environment variables (skips if missing):
+  - `POSTGRES_HOST` (required to enable), optional `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASS`.
+  - PostgreSQL identifiers are generated with double quotes by the schema grammar.
+- MySQL tests require:
+  - `MYSQL_HOST` (required to enable), optional `MYSQL_PORT`, `MYSQL_DB`, `MYSQL_USER`, `MYSQL_PASS`.
+
 ## Quick start
 
 Minimal example with SQLite (file db.sqlite) and a simple `users` DAO/DTO.
