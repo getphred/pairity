@@ -40,7 +40,7 @@
   "require": {
     "php": ">=8.1",
     "ext-mongodb": "*",
-    "mongodb/mongodb": "^1.19"
+    "mongodb/mongodb": "^1.22"
   },
   "autoload": {
     "psr-4": {
