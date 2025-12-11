@@ -55,7 +55,9 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: pdo, pdo_mysql, pdo_sqlite, pdo_pgsql, mongodb
+          # Pin ext-mongodb to a 2.x line compatible with mongodb/mongodb ^2.0
+          # This ensures Composer installs cleanly and tests run against PHPLIB 2.x
+          extensions: pdo, pdo_mysql, pdo_sqlite, pdo_pgsql, mongodb-2.1.4
           coverage: none
 
       - name: Install dependencies
