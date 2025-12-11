@@ -7,6 +7,22 @@ use Pairity\Schema\ColumnDefinition;
 
 class PostgresGrammar extends Grammar
 {
+    /**
+     * PostgreSQL uses double quotes for identifiers. Override default backtick wrapping.
+     */
+    protected function wrap(string $identifier): string
+    {
+        if ($identifier === '*') {
+            return '*';
+        }
+        // Quote each dot-delimited segment (e.g., schema.table or table.column)
+        $parts = explode('.', $identifier);
+        $quoted = array_map(static function (string $part): string {
+            return '"' . str_replace('"', '""', $part) . '"';
+        }, $parts);
+        return implode('.', $quoted);
+    }
+
     public function compileCreate(Blueprint $blueprint): array
     {
         $cols = [];
