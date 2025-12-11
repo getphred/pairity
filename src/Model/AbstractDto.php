@@ -12,7 +12,15 @@ abstract class AbstractDto implements DtoInterface
     /** @param array<string,mixed> $attributes */
     public function __construct(array $attributes = [])
     {
-        $this->attributes = $attributes;
+        // Apply mutators if defined
+        foreach ($attributes as $key => $value) {
+            $method = $this->mutatorMethod($key);
+            if (method_exists($this, $method)) {
+                // set{Name}Attribute($value): mixed
+                $value = $this->{$method}($value);
+            }
+            $this->attributes[$key] = $value;
+        }
     }
 
     /** @param array<string,mixed> $data */
@@ -23,7 +31,13 @@ abstract class AbstractDto implements DtoInterface
 
     public function __get(string $name): mixed
     {
-        return $this->attributes[$name] ?? null;
+        $value = $this->attributes[$name] ?? null;
+        $method = $this->accessorMethod($name);
+        if (method_exists($this, $method)) {
+            // get{Name}Attribute($value): mixed
+            return $this->{$method}($value);
+        }
+        return $value;
     }
 
     public function __isset(string $name): bool
@@ -44,11 +58,26 @@ abstract class AbstractDto implements DtoInterface
     public function toArray(bool $deep = true): array
     {
         if (!$deep) {
-            return $this->attributes;
+            // Apply accessors at top level for scalar attributes
+            $out = [];
+            foreach ($this->attributes as $key => $value) {
+                $method = $this->accessorMethod($key);
+                if (method_exists($this, $method)) {
+                    $out[$key] = $this->{$method}($value);
+                } else {
+                    $out[$key] = $value;
+                }
+            }
+            return $out;
         }
 
         $result = [];
         foreach ($this->attributes as $key => $value) {
+            // Apply accessor before deep conversion for scalars/arrays
+            $method = $this->accessorMethod($key);
+            if (method_exists($this, $method)) {
+                $value = $this->{$method}($value);
+            }
             if ($value instanceof DtoInterface) {
                 $result[$key] = $value->toArray(true);
             } elseif (is_array($value)) {
@@ -65,5 +94,22 @@ abstract class AbstractDto implements DtoInterface
         }
 
         return $result;
+    }
+
+    private function accessorMethod(string $key): string
+    {
+        return 'get' . $this->studly($key) . 'Attribute';
+    }
+
+    private function mutatorMethod(string $key): string
+    {
+        return 'set' . $this->studly($key) . 'Attribute';
+    }
+
+    private function studly(string $value): string
+    {
+        $value = str_replace(['-', '_'], ' ', $value);
+        $value = ucwords($value);
+        return str_replace(' ', '', $value);
     }
 }

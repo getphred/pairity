@@ -260,6 +260,49 @@ Notes:
 - Loaded relations are attached onto the DTO under the relation name (e.g., `$user->posts`).
 - `hasOne` is supported like `hasMany` but attaches a single DTO instead of a list.
 
+### Join‑based eager loading (opt‑in, SQL)
+
+For single‑level relations on SQL DAOs, you can opt‑in to a join‑based eager loading strategy that fetches parent and related rows in one query using `LEFT JOIN`s.
+
+Usage:
+
+```php
+// Require explicit projection for related fields when joining
+$users = (new UserDao($conn))
+    ->fields('id', 'name', 'posts.title')
+    ->useJoinEager()           // opt‑in for the next call
+    ->with(['posts'])          // single‑level only in MVP
+    ->findAllBy([]);
+```
+
+Behavior and limitations (MVP):
+- Single‑level only: `with(['posts'])` is supported; nested paths like `posts.comments` fall back to the default batched strategy.
+- You must specify the fields to load from related tables via `fields('relation.column')` so the ORM can alias columns safely.
+- Supported relation types: `hasOne`, `hasMany`, `belongsTo`.
+- `belongsToMany` continues to use the portable two‑query pivot strategy.
+- Soft deletes on related tables are respected by adding `... AND related.deleted_at IS NULL` to the join condition when configured in the related DAO `schema()`.
+- Per‑relation constraints that rely on ordering/limits aren’t applied in join mode in this MVP; prefer the default batched strategy for those cases.
+
+Tip: If join mode can’t be used (e.g., nested paths or missing relation field projections), Pairity silently falls back to the portable batched eager loader.
+
+Per‑relation hint (optional):
+
+You can hint join strategy per relation path. This is useful when you want to selectively join specific relations in a single‑level eager load. The join will be used only when safe (single‑level paths and explicit relation projections are present), otherwise Pairity falls back to the portable strategy.
+
+```php
+$users = (new UserDao($conn))
+    ->fields('id','name','posts.title')
+    ->with([
+        // Hint join for posts; you can also pass a callable under 'constraint' alongside 'strategy'
+        'posts' => ['strategy' => 'join']
+    ])
+    ->findAllBy([]);
+```
+
+Notes:
+- If you also call `useJoinEager()` or `eagerStrategy('join')`, that global setting takes precedence.
+- Join eager is still limited to single‑level relations in this MVP. Nested paths (e.g., `posts.comments`) will use the portable strategy.
+
 ### belongsToMany (SQL) and pivot helpers
 
 Pairity supports many‑to‑many relations for SQL DAOs via a pivot table. Declare `belongsToMany` in your DAO’s `relations()` and use the built‑in pivot helpers `attach`, `detach`, and `sync`.
@@ -577,6 +620,75 @@ $users = (new UserDao($conn))
 $deep    = array_map(fn($u) => $u->toArray(), $users);       // deep (default)
 $shallow = array_map(fn($u) => $u->toArray(false), $users);  // shallow
 ```
+
+## Attribute accessors/mutators & custom casters (Milestone C)
+
+Pairity supports lightweight DTO accessors/mutators and pluggable per‑column casters declared in your DAO `schema()`.
+
+### DTO attribute accessors/mutators
+
+- Accessor: define `protected function get{Name}Attribute($value): mixed` to transform a field when reading via property access or `toArray()`.
+- Mutator: define `protected function set{Name}Attribute($value): mixed` to normalize a field when the DTO is hydrated from an array (constructor/fromArray).
+
+Example:
+
+```php
+class UserDto extends \Pairity\Model\AbstractDto {
+    // Uppercase name when reading
+    protected function getNameAttribute($value): mixed {
+        return is_string($value) ? strtoupper($value) : $value;
+    }
+    // Trim name on hydration
+    protected function setNameAttribute($value): mixed {
+        return is_string($value) ? trim($value) : $value;
+    }
+}
+```
+
+Accessors are applied for top‑level keys in `toArray(true|false)`. Relations (nested DTOs) apply their own accessors during their own `toArray()`.
+
+### Custom casters
+
+In addition to built‑in casts (`int`, `float`, `bool`, `string`, `datetime`, `json`), you can declare a custom caster class per column. A caster implements:
+
+```php
+use Pairity\Model\Casting\CasterInterface;
+
+final class MoneyCaster implements CasterInterface {
+    public function fromStorage(mixed $value): mixed {
+        // DB integer cents -> PHP array/object
+        return ['cents' => (int)$value];
+    }
+    public function toStorage(mixed $value): mixed {
+        // PHP array/object -> DB integer cents
+        return is_array($value) && isset($value['cents']) ? (int)$value['cents'] : (int)$value;
+    }
+}
+```
+
+Declare it in the DAO `schema()` under the column’s `cast` using its class name:
+
+```php
+protected function schema(): array
+{
+    return [
+        'primaryKey' => 'id',
+        'columns' => [
+            'id' => ['cast' => 'int'],
+            'name' => ['cast' => 'string'],
+            'price_cents' => ['cast' => MoneyCaster::class], // custom caster
+            'meta' => ['cast' => 'json'],
+        ],
+    ];
+}
+```
+
+Behavior:
+- On SELECT, Pairity hydrates the DTO and applies `fromStorage()` per column (or built‑ins).
+- On INSERT/UPDATE, Pairity applies `toStorage()` per column (or built‑ins) and maintains timestamp/soft‑delete behavior.
+- Custom caster class strings are resolved once and cached per DAO instance.
+
+See the test `tests/CastersAndAccessorsSqliteTest.php` for a complete, runnable example.
 
 ## Pagination
 

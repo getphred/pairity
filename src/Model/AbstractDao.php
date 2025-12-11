@@ -5,6 +5,7 @@ namespace Pairity\Model;
 use Pairity\Contracts\ConnectionInterface;
 use Pairity\Contracts\DaoInterface;
 use Pairity\Orm\UnitOfWork;
+use Pairity\Model\Casting\CasterInterface;
 
 abstract class AbstractDao implements DaoInterface
 {
@@ -30,6 +31,12 @@ abstract class AbstractDao implements DaoInterface
      * @var array<string, callable>
      */
     private array $withConstraints = [];
+    /**
+     * Optional per‑relation eager loading strategies for first‑level relations.
+     * Keys are relation names; values like 'join'.
+     * @var array<string,string>
+     */
+    private array $withStrategies = [];
     /** Soft delete include flags */
     private bool $includeTrashed = false;
     private bool $onlyTrashed = false;
@@ -37,6 +44,12 @@ abstract class AbstractDao implements DaoInterface
     private array $runtimeScopes = [];
     /** @var array<string, callable> */
     private array $namedScopes = [];
+    /**
+     * Optional eager loading strategy for next find* call.
+     * null (default) uses the portable subquery/batched IN strategy.
+     * 'join' opts in to join-based eager loading for supported SQL relations (single level).
+     */
+    private ?string $eagerStrategy = null;
 
     public function __construct(ConnectionInterface $connection)
     {
@@ -94,6 +107,25 @@ abstract class AbstractDao implements DaoInterface
         return $this->connection;
     }
 
+    /**
+     * Opt-in to join-based eager loading for the next find* call (SQL only, single-level relations).
+     */
+    public function useJoinEager(): static
+    {
+        $this->eagerStrategy = 'join';
+        return $this;
+    }
+
+    /**
+     * Set eager strategy explicitly: 'join' or 'subquery'. Resets after next find* call.
+     */
+    public function eagerStrategy(string $strategy): static
+    {
+        $strategy = strtolower($strategy);
+        $this->eagerStrategy = in_array($strategy, ['join', 'subquery'], true) ? $strategy : null;
+        return $this;
+    }
+
     /** @param array<string,mixed> $criteria */
     public function findOneBy(array $criteria): ?AbstractDto
     {
@@ -101,14 +133,24 @@ abstract class AbstractDao implements DaoInterface
         $this->applyRuntimeScopesToCriteria($criteria);
         [$where, $bindings] = $this->buildWhere($criteria);
         $where = $this->appendScopedWhere($where);
-        $sql = 'SELECT ' . $this->selectList() . ' FROM ' . $this->getTable() . ($where ? ' WHERE ' . $where : '') . ' LIMIT 1';
-        $rows = $this->connection->query($sql, $bindings);
-        $dto = isset($rows[0]) ? $this->hydrate($this->castRowFromStorage($rows[0])) : null;
-        if ($dto && $this->with) {
-            $this->attachRelations([$dto]);
+        $dto = null;
+        if ($this->with && $this->shouldUseJoinEager()) {
+            [$sql, $bindings2, $meta] = $this->buildJoinSelect($where, $bindings, 1, 0);
+            $rows = $this->connection->query($sql, $bindings2);
+            $list = $this->hydrateFromJoinRows($rows, $meta);
+            $dto = $list[0] ?? null;
+        } else {
+            $sql = 'SELECT ' . $this->selectList() . ' FROM ' . $this->getTable() . ($where ? ' WHERE ' . $where : '') . ' LIMIT 1';
+            $rows = $this->connection->query($sql, $bindings);
+            $dto = isset($rows[0]) ? $this->hydrate($this->castRowFromStorage($rows[0])) : null;
+            if ($dto && $this->with) {
+                $this->attachRelations([$dto]);
+            }
         }
         $this->resetFieldSelections();
         $this->resetRuntimeScopes();
+        $this->eagerStrategy = null; // reset
+        $this->withStrategies = [];
         return $dto;
     }
 
@@ -134,14 +176,22 @@ abstract class AbstractDao implements DaoInterface
         $this->applyRuntimeScopesToCriteria($criteria);
         [$where, $bindings] = $this->buildWhere($criteria);
         $where = $this->appendScopedWhere($where);
-        $sql = 'SELECT ' . $this->selectList() . ' FROM ' . $this->getTable() . ($where ? ' WHERE ' . $where : '');
-        $rows = $this->connection->query($sql, $bindings);
-        $dtos = array_map(fn($r) => $this->hydrate($this->castRowFromStorage($r)), $rows);
-        if ($dtos && $this->with) {
-            $this->attachRelations($dtos);
+        if ($this->with && $this->shouldUseJoinEager()) {
+            [$sql2, $bindings2, $meta] = $this->buildJoinSelect($where, $bindings, null, null);
+            $rows = $this->connection->query($sql2, $bindings2);
+            $dtos = $this->hydrateFromJoinRows($rows, $meta);
+        } else {
+            $sql = 'SELECT ' . $this->selectList() . ' FROM ' . $this->getTable() . ($where ? ' WHERE ' . $where : '');
+            $rows = $this->connection->query($sql, $bindings);
+            $dtos = array_map(fn($r) => $this->hydrate($this->castRowFromStorage($r)), $rows);
+            if ($dtos && $this->with) {
+                $this->attachRelations($dtos);
+            }
         }
         $this->resetFieldSelections();
         $this->resetRuntimeScopes();
+        $this->eagerStrategy = null; // reset
+        $this->withStrategies = [];
         return $dtos;
     }
 
@@ -176,6 +226,8 @@ abstract class AbstractDao implements DaoInterface
         }
         $this->resetFieldSelections();
         $this->resetRuntimeScopes();
+        $this->eagerStrategy = null; // reset
+        $this->withStrategies = [];
 
         $lastPage = (int)max(1, (int)ceil($total / $perPage));
         return [
@@ -209,6 +261,8 @@ abstract class AbstractDao implements DaoInterface
         if ($dtos && $this->with) { $this->attachRelations($dtos); }
         $this->resetFieldSelections();
         $this->resetRuntimeScopes();
+        $this->eagerStrategy = null; // reset
+        $this->withStrategies = [];
 
         return [
             'data' => $dtos,
@@ -761,7 +815,187 @@ abstract class AbstractDao implements DaoInterface
         $this->with = [];
         $this->withTree = [];
         $this->withConstraints = [];
+        $this->withStrategies = [];
         // do not reset relationFields here; they may be reused by subsequent loads in the same call
+    }
+
+    // ===== Join-based eager loading (opt-in, single-level) =====
+
+    /** Determine if join-based eager should be used for current with() selection. */
+    private function shouldUseJoinEager(): bool
+    {
+        // Determine if join strategy is desired globally or per relation
+        $globalJoin = ($this->eagerStrategy === 'join');
+        $perRelJoin = false;
+        if (!$globalJoin && $this->with) {
+            $allMarked = true;
+            foreach ($this->with as $rel) {
+                if (($this->withStrategies[$rel] ?? null) !== 'join') { $allMarked = false; break; }
+            }
+            $perRelJoin = $allMarked;
+        }
+        if (!$globalJoin && !$perRelJoin) return false;
+        // Only single-level paths supported in join MVP (no nested trees)
+        foreach ($this->withTree as $rel => $sub) {
+            if (!empty($sub)) return false; // nested present => fallback
+        }
+        // Require relationFields for each relation to know what to select safely
+        foreach ($this->with as $rel) {
+            if (!isset($this->relationFields[$rel]) || empty($this->relationFields[$rel])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Build a SELECT with LEFT JOINs for the requested relations.
+     * Returns [sql, bindings, meta] where meta describes relation aliases and selected columns.
+     * @param ?int $limit
+     * @param ?int $offset
+     * @return array{0:string,1:array<string,mixed>,2:array<string,mixed>}
+     */
+    private function buildJoinSelect(string $baseWhere, array $bindings, ?int $limit, ?int $offset): array
+    {
+        $t0 = 't0';
+        $pk = $this->getPrimaryKey();
+        // Base select: ensure PK is included
+        $baseCols = $this->selectedFields ?: ['*'];
+        if ($baseCols === ['*'] || !in_array($pk, $baseCols, true)) {
+            // Select * to keep behavior; PK is present implicitly
+            $baseSelect = "$t0.*";
+        } else {
+            $quoted = array_map(fn($c) => "$t0.$c", $baseCols);
+            $baseSelect = implode(', ', $quoted);
+        }
+
+        $selects = [ $baseSelect ];
+        $joins = [];
+        $meta = [ 'rels' => [] ];
+
+        $relations = $this->relations();
+        $aliasIndex = 1;
+        foreach ($this->with as $name) {
+            if (!isset($relations[$name])) continue;
+            $cfg = $relations[$name];
+            $type = (string)($cfg['type'] ?? '');
+            $daoClass = $cfg['dao'] ?? null;
+            if (!is_string($daoClass) || $type === '') continue;
+            /** @var class-string<AbstractDao> $daoClass */
+            $relDao = new $daoClass($this->getConnection());
+            $ta = 't' . $aliasIndex++;
+            $on = '';
+            if ($type === 'hasMany' || $type === 'hasOne') {
+                $foreignKey = (string)($cfg['foreignKey'] ?? '');
+                $localKey = (string)($cfg['localKey'] ?? 'id');
+                if ($foreignKey === '') continue;
+                $on = "$ta.$foreignKey = $t0.$localKey";
+            } elseif ($type === 'belongsTo') {
+                $foreignKey = (string)($cfg['foreignKey'] ?? '');
+                $otherKey = (string)($cfg['otherKey'] ?? 'id');
+                if ($foreignKey === '') continue;
+                $on = "$ta.$otherKey = $t0.$foreignKey";
+            } else {
+                // belongsToMany not supported in join MVP
+                continue;
+            }
+            // Soft-delete scope for related in JOIN (append in ON)
+            if ($relDao->hasSoftDeletes()) {
+                $del = $relDao->softDeleteConfig()['deletedAt'] ?? 'deleted_at';
+                $on .= " AND $ta.$del IS NULL";
+            }
+            $joins[] = 'LEFT JOIN ' . $relDao->getTable() . ' ' . $ta . ' ON ' . $on;
+            // Select related fields with alias prefix
+            $relCols = $this->relationFields[$name] ?? [];
+            $pref = $name . '__';
+            foreach ($relCols as $col) {
+                $selects[] = "$ta.$col AS `{$pref}{$col}`";
+            }
+            $meta['rels'][$name] = [ 'alias' => $ta, 'type' => $type, 'dao' => $relDao, 'cols' => $relCols ];
+        }
+
+        $sql = 'SELECT ' . implode(', ', $selects) . ' FROM ' . $this->getTable() . ' ' . $t0;
+        if ($joins) {
+            $sql .= ' ' . implode(' ', $joins);
+        }
+        if ($baseWhere !== '') {
+            $sql .= ' WHERE ' . $baseWhere;
+        }
+        if ($limit !== null) {
+            $sql .= ' LIMIT ' . (int)$limit;
+        }
+        if ($offset !== null) {
+            $sql .= ' OFFSET ' . (int)$offset;
+        }
+        return [$sql, $bindings, $meta];
+    }
+
+    /**
+     * Hydrate DTOs from joined rows with aliased related columns.
+     * @param array<int,array<string,mixed>> $rows
+     * @param array<string,mixed> $meta
+     * @return array<int,AbstractDto>
+     */
+    private function hydrateFromJoinRows(array $rows, array $meta): array
+    {
+        if (!$rows) return [];
+        $pk = $this->getPrimaryKey();
+        $out = [];
+        $byId = [];
+        foreach ($rows as $row) {
+            // Split base and related segments (related segments are prefixed as rel__col)
+            $base = [];
+            $relSegments = [];
+            foreach ($row as $k => $v) {
+                if (is_string($k) && str_contains($k, '__')) {
+                    [$rel, $col] = explode('__', $k, 2);
+                    $relSegments[$rel][$col] = $v;
+                } else {
+                    $base[$k] = $v;
+                }
+            }
+            $idVal = $base[$pk] ?? null;
+            if ($idVal === null) {
+                // cannot hydrate without PK; skip row
+                continue;
+            }
+            $idKey = (string)$idVal;
+            if (!isset($byId[$idKey])) {
+                $dto = $this->hydrate($this->castRowFromStorage($base));
+                $byId[$idKey] = $dto;
+                $out[] = $dto;
+            }
+            $parent = $byId[$idKey];
+            // Attach each relation if there are any non-null values
+            foreach (($meta['rels'] ?? []) as $name => $info) {
+                $seg = $relSegments[$name] ?? [];
+                // Detect empty (all null)
+                $allNull = true;
+                foreach ($seg as $vv) { if ($vv !== null) { $allNull = false; break; } }
+                if ($allNull) {
+                    // Ensure default: hasMany => [], hasOne/belongsTo => null (only set if not already set)
+                    if (!isset($parent->toArray(false)[$name])) {
+                        if (($info['type'] ?? '') === 'hasMany') { $parent->setRelation($name, []); }
+                        else { $parent->setRelation($name, null); }
+                    }
+                    continue;
+                }
+                /** @var AbstractDao $relDao */
+                $relDao = $info['dao'];
+                // Cast and hydrate child DTO
+                $child = $relDao->hydrate($relDao->castRowFromStorage($seg));
+                if (($info['type'] ?? '') === 'hasMany') {
+                    $current = $parent->toArray(false)[$name] ?? [];
+                    if (!is_array($current)) { $current = []; }
+                    // Append; no dedup to keep simple
+                    $current[] = $child;
+                    $parent->setRelation($name, $current);
+                } else {
+                    $parent->setRelation($name, $child);
+                }
+            }
+        }
+        return $out;
     }
 
     // ===== belongsToMany helpers (pivot operations) =====
@@ -861,15 +1095,23 @@ abstract class AbstractDao implements DaoInterface
     public function with(array $relations): static
     {
         // Accept ['rel', 'rel.child'] or ['rel' => callable, 'rel.child' => callable]
+        // Also accepts config arrays like ['rel' => ['strategy' => 'join']] and
+        // ['rel' => ['strategy' => 'join', 'constraint' => callable]]
         $names = [];
         $tree = [];
         foreach ($relations as $key => $value) {
             if (is_int($key)) { // plain name
                 $path = (string)$value;
                 $this->insertRelationPath($tree, $path);
-            } else { // constraint
+            } else { // constraint or config
                 $path = (string)$key;
-                if (is_callable($value)) {
+                if (is_array($value)) {
+                    $strategy = isset($value['strategy']) ? strtolower((string)$value['strategy']) : null;
+                    if ($strategy) { $this->withStrategies[$path] = $strategy; }
+                    if (isset($value['constraint']) && is_callable($value['constraint'])) {
+                        $this->withConstraints[$path] = $value['constraint'];
+                    }
+                } elseif (is_callable($value)) {
                     $this->withConstraints[$path] = $value;
                 }
                 $this->insertRelationPath($tree, $path);
@@ -1047,6 +1289,11 @@ abstract class AbstractDao implements DaoInterface
     private function castFromStorage(string $type, mixed $value): mixed
     {
         if ($value === null) return null;
+        // Support custom caster classes via class-string in schema 'cast'
+        $caster = $this->resolveCaster($type);
+        if ($caster) {
+            return $caster->fromStorage($value);
+        }
         switch ($type) {
             case 'int': return (int)$value;
             case 'float': return (float)$value;
@@ -1120,6 +1367,11 @@ abstract class AbstractDao implements DaoInterface
     private function castForStorage(string $type, mixed $value): mixed
     {
         if ($value === null) return null;
+        // Support custom caster classes via class-string in schema 'cast'
+        $caster = $this->resolveCaster($type);
+        if ($caster) {
+            return $caster->toStorage($value);
+        }
         switch ($type) {
             case 'int': return (int)$value;
             case 'float': return (float)$value;
@@ -1137,6 +1389,31 @@ abstract class AbstractDao implements DaoInterface
             default:
                 return $value;
         }
+    }
+
+    /** Cache for resolved caster instances. @var array<string, CasterInterface> */
+    private array $casterCache = [];
+
+    /** Resolve a caster from a type/class string. */
+    private function resolveCaster(string $type): ?CasterInterface
+    {
+        // Not a class-string? return null to use built-ins
+        if (!class_exists($type)) {
+            return null;
+        }
+        if (isset($this->casterCache[$type])) {
+            return $this->casterCache[$type];
+        }
+        try {
+            $obj = new $type();
+        } catch (\Throwable) {
+            return null;
+        }
+        if ($obj instanceof CasterInterface) {
+            $this->casterCache[$type] = $obj;
+            return $obj;
+        }
+        return null;
     }
 
     private function nowString(): string
