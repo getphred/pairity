@@ -7,6 +7,9 @@ namespace Pairity\Tests;
 use PHPUnit\Framework\TestCase;
 use Pairity\NoSql\Mongo\MongoConnectionManager;
 
+/**
+ * @group mongo-integration
+ */
 final class MongoAdapterTest extends TestCase
 {
     private function hasMongoExt(): bool
@@ -26,6 +29,13 @@ final class MongoAdapterTest extends TestCase
                 'host' => getenv('MONGO_HOST') ?: '127.0.0.1',
                 'port' => (int)(getenv('MONGO_PORT') ?: 27017),
             ]);
+        } catch (\Throwable $e) {
+            $this->markTestSkipped('Mongo not available: ' . $e->getMessage());
+        }
+
+        // Ping server to ensure availability
+        try {
+            $conn->getClient()->selectDatabase('admin')->command(['ping' => 1]);
         } catch (\Throwable $e) {
             $this->markTestSkipped('Mongo not available: ' . $e->getMessage());
         }

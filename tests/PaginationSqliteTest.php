@@ -9,6 +9,9 @@ use Pairity\Database\ConnectionManager;
 use Pairity\Model\AbstractDao;
 use Pairity\Model\AbstractDto;
 
+/**
+ * @group sqlite-integration
+ */
 final class PaginationSqliteTest extends TestCase
 {
     private function conn()
@@ -28,23 +31,28 @@ final class PaginationSqliteTest extends TestCase
         $PostDto = new class([]) extends AbstractDto {};
         $uClass = get_class($UserDto); $pClass = get_class($PostDto);
 
-        // DAOs
-        $PostDao = new class($conn, $pClass) extends AbstractDao {
-            private string $dto; public function __construct($c, string $dto) { parent::__construct($c); $this->dto = $dto; }
+        // DAOs (constructors accept only connection; DTO/related FQCNs via static props)
+        $PostDao = new class($conn) extends AbstractDao {
+            public static string $dto;
+            public function __construct($c) { parent::__construct($c); }
             public function getTable(): string { return 'posts'; }
-            protected function dtoClass(): string { return $this->dto; }
+            protected function dtoClass(): string { return self::$dto; }
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'user_id'=>['cast'=>'int'],'title'=>['cast'=>'string']]]; }
         };
 
-        $UserDao = new class($conn, $uClass, get_class($PostDao)) extends AbstractDao {
-            private string $dto; private string $postDaoClass; public function __construct($c,string $dto,string $p){ parent::__construct($c); $this->dto=$dto; $this->postDaoClass=$p; }
+        $postDaoClass = get_class($PostDao);
+        $postDaoClass::$dto = $pClass;
+
+        $UserDao = new class($conn) extends AbstractDao {
+            public static string $dto; public static string $postDaoClass;
+            public function __construct($c){ parent::__construct($c); }
             public function getTable(): string { return 'users'; }
-            protected function dtoClass(): string { return $this->dto; }
+            protected function dtoClass(): string { return self::$dto; }
             protected function relations(): array {
                 return [
                     'posts' => [
                         'type' => 'hasMany',
-                        'dao'  => $this->postDaoClass,
+                        'dao'  => self::$postDaoClass,
                         'foreignKey' => 'user_id',
                         'localKey'   => 'id',
                     ],
@@ -53,8 +61,12 @@ final class PaginationSqliteTest extends TestCase
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'email'=>['cast'=>'string'],'status'=>['cast'=>'string']]]; }
         };
 
-        $postDao = new $PostDao($conn, $pClass);
-        $userDao = new $UserDao($conn, $uClass, get_class($postDao));
+        $userDaoClass = get_class($UserDao);
+        $userDaoClass::$dto = $uClass;
+        $userDaoClass::$postDaoClass = $postDaoClass;
+
+        $postDao = new $postDaoClass($conn);
+        $userDao = new $userDaoClass($conn);
 
         // seed 35 users (20 active, 15 inactive)
         for ($i=1; $i<=35; $i++) {

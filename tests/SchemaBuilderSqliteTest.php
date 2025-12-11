@@ -20,13 +20,13 @@ final class SchemaBuilderSqliteTest extends TestCase
 
         $schema = SchemaManager::forConnection($conn);
 
-        // Create table
+        // Create table (avoid named indexes for SQLite portability)
         $schema->create('widgets', function (Blueprint $t) {
             $t->increments('id');
             $t->string('name', 100)->nullable();
             $t->integer('qty');
-            $t->unique(['name'], 'widgets_name_uk');
-            $t->index(['qty'], 'widgets_qty_idx');
+            $t->unique(['name']);
+            $t->index(['qty']);
         });
 
         // Verify table exists

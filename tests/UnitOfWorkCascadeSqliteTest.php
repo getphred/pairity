@@ -30,21 +30,17 @@ final class UnitOfWorkCascadeSqliteTest extends TestCase
         $userDtoClass = get_class($userDto);
         $postDtoClass = get_class($postDto);
 
-        // DAOs with hasMany relation and cascadeDelete=true
-        $UserDao = new class($conn, $userDtoClass, $postDtoClass) extends AbstractDao {
-            private string $userDto; private string $postDto;
-            public function __construct($c, string $u, string $p) { parent::__construct($c); $this->userDto = $u; $this->postDto = $p; }
+        // DAOs with hasMany relation and cascadeDelete=true (constructors accept only connection)
+        $UserDao = new class($conn) extends AbstractDao {
+            public static string $userDto; public static string $postDaoClass;
+            public function __construct($c) { parent::__construct($c); }
             public function getTable(): string { return 'users'; }
-            protected function dtoClass(): string { return $this->userDto; }
+            protected function dtoClass(): string { return self::$userDto; }
             protected function relations(): array {
                 return [
                     'posts' => [
                         'type' => 'hasMany',
-                        'dao'  => get_class(new class($this->getConnection(), $this->postDto) extends AbstractDao {
-                            private string $dto; public function __construct($c, string $d) { parent::__construct($c); $this->dto = $d; }
-                            public function getTable(): string { return 'posts'; }
-                            protected function dtoClass(): string { return $this->dto; }
-                        }),
+                        'dao'  => self::$postDaoClass,
                         'foreignKey' => 'user_id',
                         'localKey'   => 'id',
                         'cascadeDelete' => true,
@@ -54,15 +50,23 @@ final class UnitOfWorkCascadeSqliteTest extends TestCase
             protected function schema(): array { return ['primaryKey' => 'id', 'columns' => ['id'=>['cast'=>'int'],'email'=>['cast'=>'string']]]; }
         };
 
-        $PostDao = new class($conn, $postDtoClass) extends AbstractDao {
-            private string $dto; public function __construct($c, string $d) { parent::__construct($c); $this->dto = $d; }
+        $PostDao = new class($conn) extends AbstractDao {
+            public static string $dto;
+            public function __construct($c) { parent::__construct($c); }
             public function getTable(): string { return 'posts'; }
-            protected function dtoClass(): string { return $this->dto; }
+            protected function dtoClass(): string { return self::$dto; }
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'user_id'=>['cast'=>'int'],'title'=>['cast'=>'string']]]; }
         };
 
-        $userDao = new $UserDao($conn, $userDtoClass, $postDtoClass);
-        $postDao = new $PostDao($conn, $postDtoClass);
+        $postDaoClass = get_class($PostDao);
+        $postDaoClass::$dto = $postDtoClass;
+
+        $userDaoClass = get_class($UserDao);
+        $userDaoClass::$userDto = $userDtoClass;
+        $userDaoClass::$postDaoClass = $postDaoClass;
+
+        $userDao = new $userDaoClass($conn);
+        $postDao = new $postDaoClass($conn);
 
         // seed
         $u = $userDao->insert(['email' => 'c@example.com']);

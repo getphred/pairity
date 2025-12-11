@@ -31,25 +31,27 @@ final class BelongsToManySqliteTest extends TestCase
         $roleDtoClass = get_class($RoleDto);
 
         // DAOs
-        $RoleDao = new class($conn, $roleDtoClass) extends AbstractDao {
-            private string $dto;
-            public function __construct($c, string $dto) { parent::__construct($c); $this->dto = $dto; }
+        $RoleDao = new class($conn) extends AbstractDao {
+            public static string $dto;
+            public function __construct($c) { parent::__construct($c); }
             public function getTable(): string { return 'roles'; }
-            protected function dtoClass(): string { return $this->dto; }
+            protected function dtoClass(): string { return self::$dto; }
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'name'=>['cast'=>'string']]]; }
         };
+        $roleDaoClass = get_class($RoleDao);
+        $roleDaoClass::$dto = $roleDtoClass;
 
-        $UserDao = new class($conn, $userDtoClass, get_class($RoleDao)) extends AbstractDao {
-            private string $dto; private string $roleDaoClass;
-            public function __construct($c, string $dto, string $roleDaoClass) { parent::__construct($c); $this->dto = $dto; $this->roleDaoClass = $roleDaoClass; }
+        $UserDao = new class($conn) extends AbstractDao {
+            public static string $dto; public static string $roleDaoClass;
+            public function __construct($c) { parent::__construct($c); }
             public function getTable(): string { return 'users'; }
-            protected function dtoClass(): string { return $this->dto; }
+            protected function dtoClass(): string { return self::$dto; }
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'email'=>['cast'=>'string']]]; }
             protected function relations(): array {
                 return [
                     'roles' => [
                         'type' => 'belongsToMany',
-                        'dao'  => $this->roleDaoClass,
+                        'dao'  => self::$roleDaoClass,
                         'pivot' => 'user_role',
                         'foreignPivotKey' => 'user_id',
                         'relatedPivotKey' => 'role_id',
@@ -60,8 +62,12 @@ final class BelongsToManySqliteTest extends TestCase
             }
         };
 
-        $roleDao = new $RoleDao($conn, $roleDtoClass);
-        $userDao = new $UserDao($conn, $userDtoClass, get_class($roleDao));
+        $userDaoClass = get_class($UserDao);
+        $userDaoClass::$dto = $userDtoClass;
+        $userDaoClass::$roleDaoClass = $roleDaoClass;
+
+        $roleDao = new $roleDaoClass($conn);
+        $userDao = new $userDaoClass($conn);
 
         // seed
         $u = $userDao->insert(['email' => 'p@example.com']);

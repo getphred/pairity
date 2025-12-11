@@ -9,6 +9,9 @@ use Pairity\NoSql\Mongo\MongoConnectionManager;
 use Pairity\NoSql\Mongo\AbstractMongoDao;
 use Pairity\Model\AbstractDto;
 
+/**
+ * @group mongo-integration
+ */
 final class MongoRelationsTest extends TestCase
 {
     private function hasMongoExt(): bool { return \extension_loaded('mongodb'); }
@@ -23,6 +26,12 @@ final class MongoRelationsTest extends TestCase
                 'host' => \getenv('MONGO_HOST') ?: '127.0.0.1',
                 'port' => (int)(\getenv('MONGO_PORT') ?: 27017),
             ]);
+        } catch (\Throwable $e) {
+            $this->markTestSkipped('Mongo not available: ' . $e->getMessage());
+        }
+        // Ping server to ensure availability
+        try {
+            $conn->getClient()->selectDatabase('admin')->command(['ping' => 1]);
         } catch (\Throwable $e) {
             $this->markTestSkipped('Mongo not available: ' . $e->getMessage());
         }
