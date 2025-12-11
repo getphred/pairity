@@ -51,6 +51,11 @@ abstract class AbstractDao implements DaoInterface
      * 'join' opts in to join-based eager loading for supported SQL relations (single level).
      */
     private ?string $eagerStrategy = null;
+    /** Memoized schema/relations for perf */
+    private ?array $schemaCache = null;
+    private ?array $relationsCache = null;
+    /** Eager IN batching size for related queries */
+    protected int $inBatchSize = 1000;
 
     public function __construct(ConnectionInterface $connection)
     {
@@ -92,6 +97,13 @@ abstract class AbstractDao implements DaoInterface
     protected function schema(): array
     {
         return [];
+    }
+
+    /** Override point: set eager IN batching size (default 1000). */
+    public function setInBatchSize(int $size): static
+    {
+        $this->inBatchSize = max(1, $size);
+        return $this;
     }
 
     public function getPrimaryKey(): string
@@ -482,7 +494,7 @@ abstract class AbstractDao implements DaoInterface
     /** Expose relation metadata for UoW ordering/cascades. */
     public function relationMap(): array
     {
-        return $this->relations();
+        return $this->getRelations();
     }
 
     /**
@@ -530,21 +542,26 @@ abstract class AbstractDao implements DaoInterface
             return [];
         }
         $values = array_values(array_unique($values, SORT_REGULAR));
-        $placeholders = [];
-        $bindings = [];
-        foreach ($values as $i => $val) {
-            $ph = "in_{$i}";
-            $placeholders[] = ":{$ph}";
-            $bindings[$ph] = $val;
+        $chunks = array_chunk($values, max(1, (int)$this->inBatchSize));
+        $selectList = $selectFields && $selectFields !== ['*'] ? implode(', ', $selectFields) : $this->selectList();
+        $dtos = [];
+        foreach ($chunks as $chunkIdx => $chunk) {
+            $placeholders = [];
+            $bindings = [];
+            foreach ($chunk as $i => $val) {
+                $ph = "in_{$chunkIdx}_{$i}";
+                $placeholders[] = ":{$ph}";
+                $bindings[$ph] = $val;
+            }
+            $where = $column . ' IN (' . implode(', ', $placeholders) . ')';
+            $where = $this->appendScopedWhere($where);
+            $sql = 'SELECT ' . $selectList . ' FROM ' . $this->getTable() . ' WHERE ' . $where;
+            $rows = $this->connection->query($sql, $bindings);
+            foreach ($rows as $r) {
+                $dtos[] = $this->hydrate($this->castRowFromStorage($r));
+            }
         }
-        $selectList = $selectFields && $selectFields !== ['*']
-            ? implode(', ', $selectFields)
-            : $this->selectList();
-        $where = $column . ' IN (' . implode(', ', $placeholders) . ')';
-        $where = $this->appendScopedWhere($where);
-        $sql = 'SELECT ' . $selectList . ' FROM ' . $this->getTable() . ' WHERE ' . $where;
-        $rows = $this->connection->query($sql, $bindings);
-        return array_map(fn($r) => $this->hydrate($this->castRowFromStorage($r)), $rows);
+        return $dtos;
     }
 
     /**
@@ -660,7 +677,7 @@ abstract class AbstractDao implements DaoInterface
     protected function attachRelations(array $parents): void
     {
         if (!$parents) return;
-        $relations = $this->relations();
+        $relations = $this->getRelations();
         foreach ($this->with as $name) {
             if (!isset($relations[$name])) {
                 continue; // silently ignore unknown
@@ -904,7 +921,7 @@ abstract class AbstractDao implements DaoInterface
         $joins = [];
         $meta = [ 'rels' => [] ];
 
-        $relations = $this->relations();
+        $relations = $this->getRelations();
         $aliasIndex = 1;
         foreach ($this->with as $name) {
             if (!isset($relations[$name])) continue;
@@ -1041,7 +1058,7 @@ abstract class AbstractDao implements DaoInterface
     public function attach(string $relationName, int|string $parentId, array $relatedIds): int
     {
         if (!$relatedIds) return 0;
-        $cfg = $this->relations()[$relationName] ?? null;
+        $cfg = $this->getRelations()[$relationName] ?? null;
         if (!is_array($cfg) || ($cfg['type'] ?? '') !== 'belongsToMany') {
             throw new \InvalidArgumentException("Relation '{$relationName}' is not a belongsToMany relation");
         }
@@ -1071,7 +1088,7 @@ abstract class AbstractDao implements DaoInterface
      */
     public function detach(string $relationName, int|string $parentId, array $relatedIds = []): int
     {
-        $cfg = $this->relations()[$relationName] ?? null;
+        $cfg = $this->getRelations()[$relationName] ?? null;
         if (!is_array($cfg) || ($cfg['type'] ?? '') !== 'belongsToMany') {
             throw new \InvalidArgumentException("Relation '{$relationName}' is not a belongsToMany relation");
         }
@@ -1100,7 +1117,7 @@ abstract class AbstractDao implements DaoInterface
      */
     public function sync(string $relationName, int|string $parentId, array $relatedIds): array
     {
-        $cfg = $this->relations()[$relationName] ?? null;
+        $cfg = $this->getRelations()[$relationName] ?? null;
         if (!is_array($cfg) || ($cfg['type'] ?? '') !== 'belongsToMany') {
             throw new \InvalidArgumentException("Relation '{$relationName}' is not a belongsToMany relation");
         }
@@ -1240,7 +1257,21 @@ abstract class AbstractDao implements DaoInterface
 
     protected function getSchema(): array
     {
-        return $this->schema();
+        if ($this->schemaCache !== null) {
+            return $this->schemaCache;
+        }
+        $this->schemaCache = $this->schema();
+        return $this->schemaCache;
+    }
+
+    /** Return memoized relations metadata. */
+    protected function getRelations(): array
+    {
+        if ($this->relationsCache !== null) {
+            return $this->relationsCache;
+        }
+        $this->relationsCache = $this->relations();
+        return $this->relationsCache;
     }
 
     protected function hasSoftDeletes(): bool

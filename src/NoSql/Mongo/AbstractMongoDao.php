@@ -44,6 +44,11 @@ abstract class AbstractMongoDao
     /** @var array<string, callable> */
     private array $namedScopes = [];
 
+    /** Memoized relations */
+    private ?array $relationsCache = null;
+    /** Eager IN batching size for related lookups */
+    protected int $inBatchSize = 1000;
+
     public function __construct(MongoConnectionInterface $connection)
     {
         $this->connection = $connection;
@@ -65,6 +70,23 @@ abstract class AbstractMongoDao
     protected function relations(): array
     {
         return [];
+    }
+
+    /** Return memoized relations map. */
+    protected function getRelations(): array
+    {
+        if ($this->relationsCache !== null) {
+            return $this->relationsCache;
+        }
+        $this->relationsCache = $this->relations();
+        return $this->relationsCache;
+    }
+
+    /** Override point: set eager IN batching size (default 1000). */
+    public function setInBatchSize(int $size): static
+    {
+        $this->inBatchSize = max(1, $size);
+        return $this;
     }
 
     // ========= Query modifiers =========
@@ -295,11 +317,17 @@ abstract class AbstractMongoDao
         if (!$values) return [];
         // Normalize values (unique)
         $values = array_values(array_unique($values));
-        $filter = [ $field => ['$in' => $values] ];
-        $this->applyRuntimeScopesToFilter($filter);
-        $opts = $this->buildOptions();
-        $docs = $this->connection->find($this->databaseName(), $this->collection(), $filter, $opts);
-        return array_map(fn($d) => $this->hydrate($d), is_iterable($docs) ? $docs : []);
+        $chunks = array_chunk($values, max(1, (int)$this->inBatchSize));
+        $dtos = [];
+        foreach ($chunks as $chunk) {
+            $filter = [ $field => ['$in' => $chunk] ];
+            $this->applyRuntimeScopesToFilter($filter);
+            $opts = $this->buildOptions();
+            $docs = $this->connection->find($this->databaseName(), $this->collection(), $filter, $opts);
+            $iter = is_iterable($docs) ? $docs : [];
+            foreach ($iter as $d) { $dtos[] = $this->hydrate($d); }
+        }
+        return $dtos;
     }
 
     // ========= Dynamic helpers =========
@@ -523,7 +551,7 @@ abstract class AbstractMongoDao
     protected function attachRelations(array $parents): void
     {
         if (!$parents) return;
-        $relations = $this->relations();
+        $relations = $this->getRelations();
         foreach ($this->with as $name) {
             if (!isset($relations[$name])) continue;
             $cfg = $relations[$name];

@@ -34,6 +34,19 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 30
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pairity
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres" 
+          --health-interval 10s 
+          --health-timeout 5s 
+          --health-retries 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,7 +55,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: pdo, pdo_mysql, pdo_sqlite, mongodb
+          extensions: pdo, pdo_mysql, pdo_sqlite, pdo_pgsql, mongodb
           coverage: none
 
       - name: Install dependencies
@@ -61,6 +74,15 @@ jobs:
           done
           mysql -h 127.0.0.1 -uroot -proot -e 'CREATE DATABASE IF NOT EXISTS pairity;'
 
+      - name: Prepare Postgres
+        run: |
+          for i in {1..30}; do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres; then
+              break
+            fi
+            sleep 2
+          done
+
       - name: Run tests
         env:
           MYSQL_HOST: 127.0.0.1
@@ -70,5 +92,18 @@ jobs:
           MYSQL_PASS: root
           MONGO_HOST: 127.0.0.1
           MONGO_PORT: 27017
+          POSTGRES_HOST: 127.0.0.1
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: pairity
+          POSTGRES_USER: postgres
+          POSTGRES_PASS: postgres
         run: |
           vendor/bin/phpunit --colors=always
+
+      - name: Static analysis (PHPStan)
+        run: |
+          if [ -f phpstan.neon.dist ]; then vendor/bin/phpstan analyse --no-progress || true; fi
+
+      - name: Style check (PHPCS)
+        run: |
+          if [ -f phpcs.xml.dist ]; then vendor/bin/phpcs || true; fi

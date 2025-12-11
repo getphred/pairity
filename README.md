@@ -971,6 +971,28 @@ final class AuditSubscriber implements SubscriberInterface
 Events::dispatcher()->subscribe(new AuditSubscriber());
 ```
 
+## Performance knobs (Milestone G)
+
+Pairity includes a few opt‑in performance features. Defaults remain conservative and portable.
+
+- PDO prepared‑statement cache (bounded LRU):
+  - Internals: `Pairity\Database\PdoConnection` caches prepared statements by SQL string.
+  - API: `$conn->setStatementCacheSize(100);` (0 disables). Default: 100.
+
+- Query timing hook:
+  - API: `$conn->setQueryLogger(function(string $sql, array $params, float $ms) { /* log */ });`
+  - Called for both `query()` and `execute()`; zero overhead when unset.
+
+- Eager loader IN‑batching (SQL + Mongo):
+  - DAOs chunk large `IN (...)` / `$in` lookups to avoid huge parameter lists.
+  - API: `$dao->setInBatchSize(1000);` (default 1000) — affects internal relation fetches and `findAllWhereIn()`.
+
+- Metadata memoization:
+  - DAOs memoize `schema()` and `relations()` per instance to reduce repeated array building.
+  - No user action required; available automatically.
+
+Example UoW + locking + snapshots demo: see `examples/uow_locking_snapshot.php`.
+
 ## Roadmap
 
 - Relations enhancements:
