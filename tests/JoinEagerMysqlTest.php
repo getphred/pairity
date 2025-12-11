@@ -50,12 +50,12 @@ final class JoinEagerMysqlTest extends TestCase
         $PostDto = new class([]) extends AbstractDto {};
         $uClass = get_class($UserDto); $pClass = get_class($PostDto);
 
-        // DAOs
-        $PostDao = new class($conn, $postsT, $pClass) extends AbstractDao {
-            private string $table; private string $dto;
-            public function __construct($c, string $table, string $dto) { parent::__construct($c); $this->table=$table; $this->dto=$dto; }
-            public function getTable(): string { return $this->table; }
-            protected function dtoClass(): string { return $this->dto; }
+        // DAOs (constructors accept only connection; configured via static props)
+        $PostDao = new class($conn) extends AbstractDao {
+            public static string $table; public static string $dto;
+            public function __construct($c) { parent::__construct($c); }
+            public function getTable(): string { return self::$table; }
+            protected function dtoClass(): string { return self::$dto; }
             protected function schema(): array { return [
                 'primaryKey' => 'id',
                 'columns' => [ 'id'=>['cast'=>'int'], 'user_id'=>['cast'=>'int'], 'title'=>['cast'=>'string'], 'deleted_at'=>['cast'=>'datetime'] ],
@@ -63,17 +63,26 @@ final class JoinEagerMysqlTest extends TestCase
             ]; }
         };
 
-        $UserDao = new class($conn, $usersT, $uClass, get_class($PostDao)) extends AbstractDao {
-            private string $table; private string $dto; private string $postDaoClass;
-            public function __construct($c, string $table, string $dto, string $postDaoClass) { parent::__construct($c); $this->table=$table; $this->dto=$dto; $this->postDaoClass=$postDaoClass; }
-            public function getTable(): string { return $this->table; }
-            protected function dtoClass(): string { return $this->dto; }
-            protected function relations(): array { return [ 'posts' => [ 'type'=>'hasMany', 'dao'=>$this->postDaoClass, 'foreignKey'=>'user_id', 'localKey'=>'id' ] ]; }
+        $UserDao = new class($conn) extends AbstractDao {
+            public static string $table; public static string $dto; public static string $postDaoClass;
+            public function __construct($c) { parent::__construct($c); }
+            public function getTable(): string { return self::$table; }
+            protected function dtoClass(): string { return self::$dto; }
+            protected function relations(): array { return [ 'posts' => [ 'type'=>'hasMany', 'dao'=>self::$postDaoClass, 'foreignKey'=>'user_id', 'localKey'=>'id' ] ]; }
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'name'=>['cast'=>'string']]]; }
         };
 
-        $postDao = new $PostDao($conn, $postsT, $pClass);
-        $userDao = new $UserDao($conn, $usersT, $uClass, get_class($postDao));
+        // Configure static props
+        $postDaoClass = get_class($PostDao);
+        $postDaoClass::$table = $postsT;
+        $postDaoClass::$dto = $pClass;
+        $userDaoClass = get_class($UserDao);
+        $userDaoClass::$table = $usersT;
+        $userDaoClass::$dto = $uClass;
+        $userDaoClass::$postDaoClass = $postDaoClass;
+
+        $postDao = new $postDaoClass($conn);
+        $userDao = new $userDaoClass($conn);
 
         // Seed
         $u1 = $userDao->insert(['name' => 'Alice']);
@@ -85,15 +94,15 @@ final class JoinEagerMysqlTest extends TestCase
         // soft-deleted child for Bob
         $postDao->insert(['user_id' => $uid2, 'title' => 'Hidden', 'deleted_at' => gmdate('Y-m-d H:i:s')]);
 
-        // Baseline batched eager
-        $baseline = $userDao->fields('id','name','posts.title')->with(['posts'])->findAllBy([]);
+        // Baseline batched eager (include posts.user_id for grouping)
+        $baseline = $userDao->fields('id','name','posts.user_id','posts.title')->with(['posts'])->findAllBy([]);
         $this->assertCount(2, $baseline);
         $postsAlice = $baseline[0]->toArray(false)['posts'] ?? [];
         $this->assertIsArray($postsAlice);
         $this->assertCount(2, $postsAlice);
 
         // Join-based eager (global)
-        $joined = $userDao->fields('id','name','posts.title')->useJoinEager()->with(['posts'])->findAllBy([]);
+        $joined = $userDao->fields('id','name','posts.user_id','posts.title')->useJoinEager()->with(['posts'])->findAllBy([]);
         $this->assertCount(2, $joined);
         foreach ($joined as $u) {
             $posts = $u->toArray(false)['posts'] ?? [];
@@ -102,17 +111,32 @@ final class JoinEagerMysqlTest extends TestCase
             }
         }
 
-        // belongsTo join: Posts -> User
-        $UserDao2 = get_class($userDao);
-        $PostDao2 = new class($conn, $postsT, $pClass, $UserDao2, $usersT, $uClass) extends AbstractDao {
-            private string $pTable; private string $dto; private string $userDaoClass; private string $uTable; private string $uDto;
-            public function __construct($c,string $pTable,string $dto,string $userDaoClass,string $uTable,string $uDto){ parent::__construct($c); $this->pTable=$pTable; $this->dto=$dto; $this->userDaoClass=$userDaoClass; $this->uTable=$uTable; $this->uDto=$uDto; }
-            public function getTable(): string { return $this->pTable; }
-            protected function dtoClass(): string { return $this->dto; }
-            protected function relations(): array { return [ 'user' => [ 'type'=>'belongsTo', 'dao'=>get_class(new class($this->getConnection(), $this->uTable, $this->uDto) extends AbstractDao { private string $t; private string $d; public function __construct($c,string $t,string $d){ parent::__construct($c); $this->t=$t; $this->d=$d; } public function getTable(): string { return $this->t; } protected function dtoClass(): string { return $this->d; } protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'name'=>['cast'=>'string']]]; } }), 'foreignKey'=>'user_id', 'otherKey'=>'id' ] ]; }
+        // belongsTo join: Posts -> User (use static-prop pattern for both sides)
+        $UserDao2 = new class($conn) extends AbstractDao {
+            public static string $table; public static string $dto;
+            public function __construct($c){ parent::__construct($c); }
+            public function getTable(): string { return self::$table; }
+            protected function dtoClass(): string { return self::$dto; }
+            protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'name'=>['cast'=>'string']]]; }
+        };
+        $userDao2Class = get_class($UserDao2);
+        $userDao2Class::$table = $usersT;
+        $userDao2Class::$dto = $uClass;
+
+        $PostDao2 = new class($conn) extends AbstractDao {
+            public static string $table; public static string $dto; public static string $userDaoClass;
+            public function __construct($c){ parent::__construct($c); }
+            public function getTable(): string { return self::$table; }
+            protected function dtoClass(): string { return self::$dto; }
+            protected function relations(): array { return [ 'user' => [ 'type'=>'belongsTo', 'dao'=>self::$userDaoClass, 'foreignKey'=>'user_id', 'otherKey'=>'id' ] ]; }
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'user_id'=>['cast'=>'int'],'title'=>['cast'=>'string']]]; }
         };
-        $postDaoJ = new $PostDao2($conn, $postsT, $pClass, $UserDao2, $usersT, $uClass);
+        $postDao2Class = get_class($PostDao2);
+        $postDao2Class::$table = $postsT;
+        $postDao2Class::$dto = $pClass;
+        $postDao2Class::$userDaoClass = $userDao2Class;
+
+        $postDaoJ = new $postDao2Class($conn);
         $rows = $postDaoJ->fields('id','title','user.name')->useJoinEager()->with(['user'])->findAllBy([]);
         $this->assertNotEmpty($rows);
         $arr = $rows[0]->toArray(false);

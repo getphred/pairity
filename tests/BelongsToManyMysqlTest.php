@@ -52,26 +52,26 @@ final class BelongsToManyMysqlTest extends TestCase
         $RoleDto = new class([]) extends AbstractDto {};
         $userDto = get_class($UserDto); $roleDto = get_class($RoleDto);
 
-        // DAOs
-        $RoleDao = new class($conn, $rolesT, $roleDto) extends AbstractDao {
-            private string $table; private string $dto;
-            public function __construct($c, string $table, string $dto) { parent::__construct($c); $this->table = $table; $this->dto = $dto; }
-            public function getTable(): string { return $this->table; }
-            protected function dtoClass(): string { return $this->dto; }
+        // DAOs (constructors accept only connection; runtime configuration via static props)
+        $RoleDao = new class($conn) extends AbstractDao {
+            public static string $table; public static string $dto;
+            public function __construct($c) { parent::__construct($c); }
+            public function getTable(): string { return self::$table; }
+            protected function dtoClass(): string { return self::$dto; }
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'name'=>['cast'=>'string']]]; }
         };
 
-        $UserDao = new class($conn, $usersT, $userDto, get_class($RoleDao), $pivotT) extends AbstractDao {
-            private string $table; private string $dto; private string $roleDaoClass; private string $pivot;
-            public function __construct($c, string $table, string $dto, string $roleDaoClass, string $pivot) { parent::__construct($c); $this->table=$table; $this->dto=$dto; $this->roleDaoClass=$roleDaoClass; $this->pivot=$pivot; }
-            public function getTable(): string { return $this->table; }
-            protected function dtoClass(): string { return $this->dto; }
+        $UserDao = new class($conn) extends AbstractDao {
+            public static string $table; public static string $dto; public static string $roleDaoClass; public static string $pivot;
+            public function __construct($c) { parent::__construct($c); }
+            public function getTable(): string { return self::$table; }
+            protected function dtoClass(): string { return self::$dto; }
             protected function relations(): array {
                 return [
                     'roles' => [
                         'type' => 'belongsToMany',
-                        'dao'  => $this->roleDaoClass,
-                        'pivot' => $this->pivot,
+                        'dao'  => self::$roleDaoClass,
+                        'pivot' => self::$pivot,
                         'foreignPivotKey' => 'user_id',
                         'relatedPivotKey' => 'role_id',
                         'localKey' => 'id',
@@ -82,8 +82,19 @@ final class BelongsToManyMysqlTest extends TestCase
             protected function schema(): array { return ['primaryKey'=>'id','columns'=>['id'=>['cast'=>'int'],'email'=>['cast'=>'string']]]; }
         };
 
-        $roleDao = new $RoleDao($conn, $rolesT, $roleDto);
-        $userDao = new $UserDao($conn, $usersT, $userDto, get_class($roleDao), $pivotT);
+        // Configure static props for DAOs
+        $roleDaoClass = get_class($RoleDao);
+        $roleDaoClass::$table = $rolesT;
+        $roleDaoClass::$dto = $roleDto;
+
+        $userDaoClass = get_class($UserDao);
+        $userDaoClass::$table = $usersT;
+        $userDaoClass::$dto = $userDto;
+        $userDaoClass::$roleDaoClass = $roleDaoClass;
+        $userDaoClass::$pivot = $pivotT;
+
+        $roleDao = new $roleDaoClass($conn);
+        $userDao = new $userDaoClass($conn);
 
         // Seed
         $u = $userDao->insert(['email' => 'b@example.com']);
