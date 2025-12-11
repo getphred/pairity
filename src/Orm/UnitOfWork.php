@@ -5,6 +5,7 @@ namespace Pairity\Orm;
 use Closure;
 use Pairity\Model\AbstractDao as SqlDao;
 use Pairity\NoSql\Mongo\AbstractMongoDao as MongoDao;
+use Pairity\Events\Events;
 
 /**
  * Opt-in Unit of Work (MVP):
@@ -22,6 +23,12 @@ final class UnitOfWork
 
     /** @var array<string, array<string, object>> map[daoClass][id] = DTO */
     private array $identityMap = [];
+    /** @var array<string, array<string, array<string,mixed>>> snapshots[daoClass][id] = array representation */
+    private array $snapshots = [];
+    /** @var array<string, array<string, object>> daoBind[daoClass][id] = DAO instance for updates */
+    private array $daoBind = [];
+    /** Enable snapshot diffing */
+    private bool $snapshotsEnabled = false;
 
     /**
      * Queues grouped by a connection hash key.
@@ -91,12 +98,53 @@ final class UnitOfWork
     public function attach(string $daoClass, string $id, object $dto): void
     {
         $this->identityMap[$daoClass][$id] = $dto;
+        if ($this->snapshotsEnabled) {
+            // store shallow snapshot
+            $arr = [];
+            try {
+                if (method_exists($dto, 'toArray')) {
+                    /** @var array<string,mixed> $arr */
+                    $arr = $dto->toArray(false);
+                }
+            } catch (\Throwable) { $arr = []; }
+            $this->snapshots[$daoClass][$id] = is_array($arr) ? $arr : [];
+        }
     }
 
     /** Fetch an attached DTO if present. */
     public function get(string $daoClass, string $id): ?object
     {
         return $this->identityMap[$daoClass][$id] ?? null;
+    }
+
+    /** Bind a DAO instance to a managed entity for potential snapshot diff updates. */
+    public function bindDao(string $daoClass, string $id, object $dao): void
+    {
+        $this->daoBind[$daoClass][$id] = $dao;
+    }
+
+    /** Enable/disable snapshot diffing. */
+    public function enableSnapshots(bool $flag = true): static
+    {
+        $this->snapshotsEnabled = $flag;
+        return $this;
+    }
+
+    public function isManaged(string $daoClass, string $id): bool
+    {
+        return isset($this->identityMap[$daoClass][$id]);
+    }
+
+    public function detach(string $daoClass, string $id): void
+    {
+        unset($this->identityMap[$daoClass][$id], $this->snapshots[$daoClass][$id], $this->daoBind[$daoClass][$id]);
+    }
+
+    public function clear(): void
+    {
+        $this->identityMap = [];
+        $this->snapshots = [];
+        $this->daoBind = [];
     }
 
     // ===== Defer operations =====
@@ -126,10 +174,16 @@ final class UnitOfWork
     {
         // Ensure we run ops with DAO interception suspended to avoid re-enqueue
         self::suspendDuring(function () {
+            // uow.beforeCommit
+            try { $payload = ['context' => 'uow']; Events::dispatcher()->dispatch('uow.beforeCommit', $payload); } catch (\Throwable) {}
             // Grouped by connection type
             foreach ($this->queues as $entry) {
                 $conn = $entry['conn'];
                 $ops = $this->expandAndOrder($entry['ops']);
+                // Inject snapshot-based updates for managed entities with diffs
+                $ops = $this->injectSnapshotDiffUpdates($ops);
+                // Coalesce multiple updates for the same entity and order update-before-delete
+                $ops = $this->coalesceAndOrderPerEntity($ops);
                 // PDO/SQL path: has transaction(callable)
                 if (method_exists($conn, 'transaction')) {
                     $conn->transaction(function () use ($ops) {
@@ -153,6 +207,8 @@ final class UnitOfWork
                     foreach ($ops as $o) { ($o['op'])(); }
                 }
             }
+            // uow.afterCommit
+            try { $payload2 = ['context' => 'uow']; Events::dispatcher()->dispatch('uow.afterCommit', $payload2); } catch (\Throwable) {}
         });
 
         // Clear queues after successful commit
@@ -229,6 +285,143 @@ final class UnitOfWork
 
         // Basic stable order is fine since cascades were inserted before parent.
         return $expanded;
+    }
+
+    /**
+     * Inject snapshot-based updates for managed entities that have changed but were not explicitly updated.
+     * Only when snapshots are enabled.
+     * @param array<int,array{op:Closure,meta:array<string,mixed>}> $ops
+     * @return array<int,array{op:Closure,meta:array<string,mixed>}> $ops
+     */
+    private function injectSnapshotDiffUpdates(array $ops): array
+    {
+        if (!$this->snapshotsEnabled) {
+            return $ops;
+        }
+        // Build a set of entities already scheduled for update/delete
+        $scheduled = [];
+        foreach ($ops as $o) {
+            $m = $o['meta'] ?? [];
+            if (!isset($m['dao']) || !is_object($m['dao'])) continue;
+            $daoClass = get_class($m['dao']);
+            $id = (string)($m['id'] ?? '');
+            if ($id !== '') {
+                $scheduled[$daoClass][$id] = true;
+            }
+        }
+        // For each managed entity, if changed and not scheduled, enqueue update
+        foreach ($this->identityMap as $daoClass => $entities) {
+            foreach ($entities as $id => $dto) {
+                if (!$this->snapshotsEnabled) break;
+                $snap = $this->snapshots[$daoClass][$id] ?? null;
+                if ($snap === null) continue;
+                $now = [];
+                try { if (method_exists($dto, 'toArray')) { $now = $dto->toArray(false); } } catch (\Throwable) { $now = []; }
+                if (!is_array($now)) $now = [];
+                $diff = $this->diffAssoc($snap, $now);
+                if (!$diff) continue;
+                if (isset($scheduled[$daoClass][$id])) continue;
+                $dao = $this->daoBind[$daoClass][$id] ?? null;
+                if (!$dao) continue;
+                // Build op that performs immediate update under suspension
+                $op = function () use ($dao, $id, $diff) {
+                    self::suspendDuring(function () use ($dao, $id, $diff) {
+                        if (method_exists($dao, 'update')) { $dao->update($id, $diff); }
+                    });
+                };
+                $ops[] = ['op' => $op, 'meta' => ['type' => 'update', 'mode' => 'byId', 'dao' => $dao, 'id' => (string)$id, 'payload' => $diff]];
+            }
+        }
+        return $ops;
+    }
+
+    /**
+     * Merge multiple updates for the same entity and ensure update happens before delete for that entity.
+     * @param array<int,array{op:Closure,meta:array<string,mixed>}> $ops
+     * @return array<int,array{op:Closure,meta:array<string,mixed>}> $ops
+     */
+    private function coalesceAndOrderPerEntity(array $ops): array
+    {
+        // Group updates by daoClass+id
+        $updateMap = [];
+        $deleteSet = [];
+        foreach ($ops as $o) {
+            $m = $o['meta'] ?? [];
+            if (!isset($m['dao']) || !is_object($m['dao'])) continue;
+            $dao = $m['dao'];
+            $daoClass = get_class($dao);
+            $id = (string)($m['id'] ?? '');
+            if (($m['type'] ?? '') === 'update' && ($m['mode'] ?? '') === 'byId' && $id !== '') {
+                $key = $daoClass . '#' . $id;
+                $payload = (array)($m['payload'] ?? []);
+                if (!isset($updateMap[$key])) { $updateMap[$key] = ['dao' => $dao, 'id' => $id, 'payload' => []]; }
+                // merge (last write wins)
+                $updateMap[$key]['payload'] = array_merge($updateMap[$key]['payload'], $payload);
+            }
+            if (($m['type'] ?? '') === 'delete' && ($m['mode'] ?? '') === 'byId' && $id !== '') {
+                $deleteSet[$daoClass . '#' . $id] = ['dao' => $dao, 'id' => $id];
+            }
+        }
+
+        if (!$updateMap) { return $ops; }
+
+        // Rebuild ops: for each original op, skip individual updates; add one merged update before a delete for the same entity
+        $result = [];
+        $emittedUpdate = [];
+        foreach ($ops as $o) {
+            $m = $o['meta'] ?? [];
+            $emit = true;
+            $dao = $m['dao'] ?? null;
+            $daoClass = is_object($dao) ? get_class($dao) : null;
+            $id = (string)($m['id'] ?? '');
+            $key = ($daoClass && $id !== '') ? ($daoClass . '#' . $id) : null;
+            if (($m['type'] ?? '') === 'update' && ($m['mode'] ?? '') === 'byId' && $key && isset($updateMap[$key])) {
+                // skip individual update; we'll emit merged one once
+                $emit = false;
+            }
+            if (($m['type'] ?? '') === 'delete' && ($m['mode'] ?? '') === 'byId' && $key && isset($updateMap[$key]) && !isset($emittedUpdate[$key])) {
+                // emit merged update before delete
+                $merged = $updateMap[$key];
+                $updOp = function () use ($merged) {
+                    self::suspendDuring(function () use ($merged) {
+                        $dao = $merged['dao']; $id = $merged['id']; $payload = $merged['payload'];
+                        if (method_exists($dao, 'update')) { $dao->update($id, $payload); }
+                    });
+                };
+                $result[] = ['op' => $updOp, 'meta' => ['type' => 'update', 'mode' => 'byId', 'dao' => $merged['dao'], 'id' => (string)$merged['id'], 'payload' => $merged['payload']]];
+                $emittedUpdate[$key] = true;
+            }
+            if ($emit) {
+                $result[] = $o;
+            }
+        }
+        // For any remaining merged updates not emitted (no delete op), append them at the end
+        foreach ($updateMap as $k => $merged) {
+            if (isset($emittedUpdate[$k])) continue;
+            $updOp = function () use ($merged) {
+                self::suspendDuring(function () use ($merged) {
+                    $dao = $merged['dao']; $id = $merged['id']; $payload = $merged['payload'];
+                    if (method_exists($dao, 'update')) { $dao->update($id, $payload); }
+                });
+            };
+            $result[] = ['op' => $updOp, 'meta' => ['type' => 'update', 'mode' => 'byId', 'dao' => $merged['dao'], 'id' => (string)$merged['id'], 'payload' => $merged['payload']]];
+        }
+        return $result;
+    }
+
+    /** @param array<string,mixed> $a @param array<string,mixed> $b */
+    private function diffAssoc(array $a, array $b): array
+    {
+        $diff = [];
+        foreach ($b as $k => $v) {
+            // only simple scalar/array comparisons; nested DTOs are out of scope
+            $av = $a[$k] ?? null;
+            if ($av !== $v) {
+                $diff[$k] = $v;
+            }
+        }
+        // Skip keys present in $a but removed in $b to avoid unintended nulling
+        return $diff;
     }
 
     /**

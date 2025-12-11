@@ -690,6 +690,66 @@ Behavior:
 
 See the test `tests/CastersAndAccessorsSqliteTest.php` for a complete, runnable example.
 
+## Unit of Work (opt‑in)
+
+Pairity includes an optional Unit of Work (UoW) that can be enabled per block to batch updates/deletes and use an identity map:
+
+```php
+use Pairity\Orm\UnitOfWork;
+
+UnitOfWork::run(function(UnitOfWork $uow) use ($userDao, $postDao) {
+    $user = $userDao->findById(42);           // identity map
+    $userDao->update(42, ['name' => 'New']);  // deferred update
+    $postDao->deleteBy(['user_id' => 42]);    // deferred delete
+}); // transactional commit
+```
+
+Behavior (MVP):
+- Outside a UoW, DAO calls execute immediately (today’s behavior).
+- Inside a UoW, updates/deletes are deferred; inserts remain immediate (to return real IDs). Commit runs within a transaction/session per connection.
+- Relation‑aware cascades: if a relation is marked with `cascadeDelete`, child deletes run before the parent delete at commit time.
+
+### Optimistic locking (MVP)
+
+You can enable optimistic locking to avoid lost updates. Two strategies are supported:
+
+- SQL via DAO `schema()`
+
+```php
+protected function schema(): array
+{
+    return [
+        'primaryKey' => 'id',
+        'columns' => [
+            'id' => ['cast' => 'int'],
+            'name' => ['cast' => 'string'],
+            'version' => ['cast' => 'int'],
+        ],
+        'locking' => [
+            'type' => 'version',     // or 'timestamp'
+            'column' => 'version',   // compare‑and‑set column
+        ],
+    ];
+}
+```
+
+When locking is enabled, `update($id, $data)` performs a compare‑and‑set on the configured column and increments it for `type = version`. If the row has changed since the read, an `OptimisticLockException` is thrown.
+
+Note: bulk `updateBy(...)` is blocked under optimistic locking to avoid unsafe mass updates.
+
+- MongoDB via DAO `locking()`
+
+```php
+protected function locking(): array
+{
+    return [ 'type' => 'version', 'column' => 'version' ];
+}
+```
+
+Mongo `update($id, $data)` reads the current `version` and issues a conditional `updateOne` with `{$inc: {version: 1}}`. If the compare fails, an `OptimisticLockException` is thrown.
+
+Tests: see `tests/OptimisticLockSqliteTest.php` (SQLite). Mongo tests are guarded and run in CI when `ext-mongodb` and a server are available.
+
 ## Pagination
 
 Both SQL and Mongo DAOs provide pagination helpers that return DTOs alongside metadata. They honor the usual query modifiers:
@@ -829,6 +889,87 @@ Behavior details:
 - Inside `UnitOfWork::run(...)`, enqueuing `UserDao->deleteById($id)` will synthesize and run `PostDao->deleteBy(['user_id' => $id])` before deleting the user.
 - Works for both SQL DAOs and Mongo DAOs.
 - Current MVP focuses on delete cascades; cascades for updates and more advanced ordering rules can be added later.
+
+## Event system (Milestone F)
+
+Pairity provides a lightweight event system so you can hook into DAO operations and UoW commits for audit logging, validation, normalization, caching hooks, etc.
+
+### Dispatcher and subscribers
+
+- Global access: `Pairity\Events\Events::dispatcher()` returns the singleton dispatcher.
+- Register listeners: `listen(string $event, callable $listener, int $priority = 0)`.
+- Register subscribers: implement `Pairity\Events\SubscriberInterface` with `getSubscribedEvents(): array` returning `event => callable|[callable, priority]`.
+
+Example listener registration:
+
+```php
+use Pairity\Events\Events;
+
+// Normalize a field before insert
+Events::dispatcher()->listen('dao.beforeInsert', function (array &$payload) {
+    // Payload always contains 'dao' and table/collection + input data by reference
+    if (($payload['table'] ?? '') === 'users') {
+        $payload['data']['name'] = trim((string)($payload['data']['name'] ?? ''));
+    }
+});
+
+// Audit after update
+Events::dispatcher()->listen('dao.afterUpdate', function (array &$payload) {
+    // $payload['dto'] is the updated DTO (SQL or Mongo)
+    // write to your log sink here
+});
+```
+
+### Event names and payloads
+
+DAO events (SQL and Mongo):
+- `dao.beforeFind`  → `{ dao, table|collection, criteria|filter& }` (criteria/filter is passed by reference)
+- `dao.afterFind`   → `{ dao, table|collection, dto|null }` or `{ dao, table|collection, dtos: DTO[] }`
+- `dao.beforeInsert`→ `{ dao, table|collection, data& }` (data by reference)
+- `dao.afterInsert` → `{ dao, table|collection, dto }`
+- `dao.beforeUpdate`→ `{ dao, table|collection, id?, criteria?, data& }` (data by reference; `criteria` for bulk SQL updates)
+- `dao.afterUpdate` → `{ dao, table|collection, dto }` (or `{ affected }` for bulk SQL `updateBy`)
+- `dao.beforeDelete`→ `{ dao, table|collection, id? , criteria|filter?& }`
+- `dao.afterDelete` → `{ dao, table|collection, id?|criteria|filter?, affected:int }`
+
+Unit of Work events:
+- `uow.beforeCommit` → `{ context: 'uow' }`
+- `uow.afterCommit`  → `{ context: 'uow' }`
+
+Notes:
+- Listeners run in priority order (higher first). Exceptions thrown inside listeners are swallowed to avoid breaking core flows.
+- When no listeners are registered, the overhead is negligible (fast-path checks).
+
+### Example subscriber
+
+```php
+use Pairity\Events\SubscriberInterface;
+use Pairity\Events\Events;
+
+final class AuditSubscriber implements SubscriberInterface
+{
+    public function getSubscribedEvents(): array
+    {
+        return [
+            'dao.afterInsert' => [[$this, 'onAfterInsert'], 10],
+            'uow.afterCommit' => [$this, 'onAfterCommit'],
+        ];
+    }
+
+    public function onAfterInsert(array &$payload): void
+    {
+        // e.g., push to queue/log sink
+    }
+
+    public function onAfterCommit(array &$payload): void
+    {
+        // flush buffered audits
+    }
+}
+
+// Somewhere during bootstrap
+Events::dispatcher()->subscribe(new AuditSubscriber());
+```
 
 ## Roadmap
 

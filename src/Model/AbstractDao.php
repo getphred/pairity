@@ -6,6 +6,7 @@ use Pairity\Contracts\ConnectionInterface;
 use Pairity\Contracts\DaoInterface;
 use Pairity\Orm\UnitOfWork;
 use Pairity\Model\Casting\CasterInterface;
+use Pairity\Events\Events;
 
 abstract class AbstractDao implements DaoInterface
 {
@@ -129,6 +130,8 @@ abstract class AbstractDao implements DaoInterface
     /** @param array<string,mixed> $criteria */
     public function findOneBy(array $criteria): ?AbstractDto
     {
+        // Events: dao.beforeFind (criteria may be mutated)
+        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => &$criteria]; Events::dispatcher()->dispatch('dao.beforeFind', $ev); } catch (\Throwable) {}
         $criteria = $this->applyDefaultScopes($criteria);
         $this->applyRuntimeScopesToCriteria($criteria);
         [$where, $bindings] = $this->buildWhere($criteria);
@@ -151,6 +154,8 @@ abstract class AbstractDao implements DaoInterface
         $this->resetRuntimeScopes();
         $this->eagerStrategy = null; // reset
         $this->withStrategies = [];
+        // Events: dao.afterFind
+        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterFind', $payload); } catch (\Throwable) {}
         return $dto;
     }
 
@@ -172,6 +177,8 @@ abstract class AbstractDao implements DaoInterface
      */
     public function findAllBy(array $criteria = []): array
     {
+        // Events: dao.beforeFind (criteria may be mutated)
+        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => &$criteria]; Events::dispatcher()->dispatch('dao.beforeFind', $ev); } catch (\Throwable) {}
         $criteria = $this->applyDefaultScopes($criteria);
         $this->applyRuntimeScopesToCriteria($criteria);
         [$where, $bindings] = $this->buildWhere($criteria);
@@ -192,6 +199,8 @@ abstract class AbstractDao implements DaoInterface
         $this->resetRuntimeScopes();
         $this->eagerStrategy = null; // reset
         $this->withStrategies = [];
+        // Events: dao.afterFind (list)
+        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dtos' => $dtos]; Events::dispatcher()->dispatch('dao.afterFind', $payload); } catch (\Throwable) {}
         return $dtos;
     }
 
@@ -278,6 +287,8 @@ abstract class AbstractDao implements DaoInterface
         if (empty($data)) {
             throw new \InvalidArgumentException('insert() requires non-empty data');
         }
+        // Events: dao.beforeInsert (allow mutation of $data)
+        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeInsert', $ev); } catch (\Throwable) {}
         $data = $this->prepareForInsert($data);
         $cols = array_keys($data);
         $placeholders = array_map(fn($c) => ':' . $c, $cols);
@@ -286,10 +297,14 @@ abstract class AbstractDao implements DaoInterface
         $id = $this->connection->lastInsertId();
         $pk = $this->getPrimaryKey();
         if ($id !== null) {
-            return $this->findById($id) ?? $this->hydrate(array_merge($data, [$pk => $id]));
+            $dto = $this->findById($id) ?? $this->hydrate(array_merge($data, [$pk => $id]));
+            try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterInsert', $payload); } catch (\Throwable) {}
+            return $dto;
         }
         // Fallback when lastInsertId is unavailable: return hydrated DTO from provided data
-        return $this->hydrate($this->castRowFromStorage($data));
+        $dto = $this->hydrate($this->castRowFromStorage($data));
+        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterInsert', $payload); } catch (\Throwable) {}
+        return $dto;
     }
 
     /** @param array<string,mixed> $data */
@@ -302,6 +317,8 @@ abstract class AbstractDao implements DaoInterface
             if (!$existing && empty($data)) {
                 throw new \InvalidArgumentException('No data provided to update and record not found');
             }
+            // Events: dao.beforeUpdate (mutate $data)
+            try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id, 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeUpdate', $ev); } catch (\Throwable) {}
             $toStore = $this->prepareForUpdate($data);
             $self = $this;
             $conn = $this->connection;
@@ -310,24 +327,18 @@ abstract class AbstractDao implements DaoInterface
                 'mode' => 'byId',
                 'dao'  => $this,
                 'id'   => (string)$id,
+                'payload' => $toStore,
             ], function () use ($self, $id, $toStore) {
                 UnitOfWork::suspendDuring(function () use ($self, $id, $toStore) {
-                    // execute real update now
-                    $sets = [];
-                    $params = [];
-                    foreach ($toStore as $col => $val) {
-                        $sets[] = "$col = :set_$col";
-                        $params["set_$col"] = $val;
-                    }
-                    $params['pk'] = $id;
-                    $sql = 'UPDATE ' . $self->getTable() . ' SET ' . implode(', ', $sets) . ' WHERE ' . $self->getPrimaryKey() . ' = :pk';
-                    $self->getConnection()->execute($sql, $params);
+                    $self->doImmediateUpdateWithLock($id, $toStore);
                 });
             });
             $base = $existing ? $existing->toArray(false) : [];
             $pk = $this->getPrimaryKey();
             $result = array_merge($base, $data, [$pk => $id]);
-            return $this->hydrate($this->castRowFromStorage($result));
+            $dto = $this->hydrate($this->castRowFromStorage($result));
+            try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterUpdate', $payload); } catch (\Throwable) {}
+            return $dto;
         }
 
         if (empty($data)) {
@@ -335,21 +346,18 @@ abstract class AbstractDao implements DaoInterface
             if ($existing) return $existing;
             throw new \InvalidArgumentException('No data provided to update and record not found');
         }
+        // Events: dao.beforeUpdate
+        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id, 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeUpdate', $ev); } catch (\Throwable) {}
         $data = $this->prepareForUpdate($data);
-        $sets = [];
-        $params = [];
-        foreach ($data as $col => $val) {
-            $sets[] = "$col = :set_$col";
-            $params["set_$col"] = $val;
-        }
-        $params['pk'] = $id;
-        $sql = 'UPDATE ' . $this->getTable() . ' SET ' . implode(', ', $sets) . ' WHERE ' . $this->getPrimaryKey() . ' = :pk';
-        $this->connection->execute($sql, $params);
+        $this->doImmediateUpdateWithLock($id, $data);
         $updated = $this->findById($id);
         if ($updated === null) {
             $pk = $this->getPrimaryKey();
-            return $this->hydrate($this->castRowFromStorage(array_merge($data, [$pk => $id])));
+            $dto = $this->hydrate($this->castRowFromStorage(array_merge($data, [$pk => $id])));
+            try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterUpdate', $payload); } catch (\Throwable) {}
+            return $dto;
         }
+        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $updated]; Events::dispatcher()->dispatch('dao.afterUpdate', $payload); } catch (\Throwable) {}
         return $updated;
     }
 
@@ -358,6 +366,7 @@ abstract class AbstractDao implements DaoInterface
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id;
+            try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
             $uow->enqueueWithMeta($conn, [
                 'type' => 'delete',
                 'mode' => 'byId',
@@ -369,6 +378,7 @@ abstract class AbstractDao implements DaoInterface
             // deferred; immediate affected count unknown
             return 0;
         }
+        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
         if ($this->hasSoftDeletes()) {
             $columns = $this->softDeleteConfig();
             $deletedAt = $columns['deletedAt'] ?? 'deleted_at';
@@ -377,7 +387,9 @@ abstract class AbstractDao implements DaoInterface
             return $this->connection->execute($sql, ['ts' => $now, 'pk' => $id]);
         }
         $sql = 'DELETE FROM ' . $this->getTable() . ' WHERE ' . $this->getPrimaryKey() . ' = :pk';
-        return $this->connection->execute($sql, ['pk' => $id]);
+        $affected = $this->connection->execute($sql, ['pk' => $id]);
+        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id, 'affected' => $affected]; Events::dispatcher()->dispatch('dao.afterDelete', $payload); } catch (\Throwable) {}
+        return $affected;
     }
 
     /** @param array<string,mixed> $criteria */
@@ -386,6 +398,7 @@ abstract class AbstractDao implements DaoInterface
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $crit = $criteria;
+            try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => &$criteria]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
             $uow->enqueueWithMeta($conn, [
                 'type' => 'delete',
                 'mode' => 'byCriteria',
@@ -396,6 +409,7 @@ abstract class AbstractDao implements DaoInterface
             });
             return 0;
         }
+        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => &$criteria]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
         if ($this->hasSoftDeletes()) {
             [$where, $bindings] = $this->buildWhere($criteria);
             if ($where === '') { return 0; }
@@ -409,7 +423,9 @@ abstract class AbstractDao implements DaoInterface
         [$where, $bindings] = $this->buildWhere($criteria);
         if ($where === '') { return 0; }
         $sql = 'DELETE FROM ' . $this->getTable() . ' WHERE ' . $where;
-        return $this->connection->execute($sql, $bindings);
+        $affected = $this->connection->execute($sql, $bindings);
+        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => $criteria, 'affected' => $affected]; Events::dispatcher()->dispatch('dao.afterDelete', $payload); } catch (\Throwable) {}
+        return $affected;
     }
 
     /**
@@ -423,6 +439,8 @@ abstract class AbstractDao implements DaoInterface
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             if (empty($data)) { return 0; }
+            // Events: dao.beforeUpdate (bulk)
+            try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => &$criteria, 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeUpdate', $ev); } catch (\Throwable) {}
             $self = $this; $conn = $this->connection; $crit = $criteria; $payload = $this->prepareForUpdate($data);
             $uow->enqueueWithMeta($conn, [
                 'type' => 'update',
@@ -438,6 +456,10 @@ abstract class AbstractDao implements DaoInterface
         if (empty($data)) {
             return 0;
         }
+        // Optimistic locking note: bulk updates under optimistic locking are not supported
+        if ($this->hasOptimisticLocking()) {
+            throw new \Pairity\Orm\OptimisticLockException('Optimistic locking enabled: use update(id, ...) instead of bulk updateBy(...)');
+        }
         [$where, $whereBindings] = $this->buildWhere($criteria);
         if ($where === '') {
             return 0;
@@ -452,7 +474,9 @@ abstract class AbstractDao implements DaoInterface
         }
 
         $sql = 'UPDATE ' . $this->getTable() . ' SET ' . implode(', ', $sets) . ' WHERE ' . $where;
-        return $this->connection->execute($sql, array_merge($setParams, $whereBindings));
+        $affected = $this->connection->execute($sql, array_merge($setParams, $whereBindings));
+        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => $criteria, 'affected' => $affected]; Events::dispatcher()->dispatch('dao.afterUpdate', $payload); } catch (\Throwable) {}
+        return $affected;
     }
 
     /** Expose relation metadata for UoW ordering/cascades. */
@@ -645,10 +669,17 @@ abstract class AbstractDao implements DaoInterface
             $type = (string)($config['type'] ?? '');
             $daoClass = $config['dao'] ?? null;
             $dtoClass = $config['dto'] ?? null; // kept for docs compatibility
-            if (!is_string($daoClass)) { continue; }
-
-            /** @var class-string<AbstractDao> $daoClass */
-            $relatedDao = new $daoClass($this->getConnection());
+            // Resolve related DAO: allow daoInstance or factory callable, else class-string
+            $relatedDao = null;
+            if (isset($config['daoInstance']) && is_object($config['daoInstance'])) {
+                $relatedDao = $config['daoInstance'];
+            } elseif (isset($config['factory']) && is_callable($config['factory'])) {
+                try { $relatedDao = ($config['factory'])($this); } catch (\Throwable) { $relatedDao = null; }
+            } elseif (is_string($daoClass)) {
+                /** @var class-string<AbstractDao> $daoClass */
+                try { $relatedDao = new $daoClass($this->getConnection()); } catch (\Throwable) { $relatedDao = null; }
+            }
+            if (!$relatedDao instanceof AbstractDao) { continue; }
             // Apply per-relation constraint, if any
             $constraint = $this->constraintForPath($name);
             if (is_callable($constraint)) {
@@ -1147,6 +1178,8 @@ abstract class AbstractDao implements DaoInterface
             $idVal = $row[$pk] ?? null;
             if ($idVal !== null) {
                 $uow->attach(static::class, (string)$idVal, $dto);
+                // Bind this DAO to allow snapshot diffing to emit updates
+                $uow->bindDao(static::class, (string)$idVal, $this);
             }
         }
         return $dto;
@@ -1419,6 +1452,69 @@ abstract class AbstractDao implements DaoInterface
     private function nowString(): string
     {
         return gmdate('Y-m-d H:i:s');
+    }
+
+    // ===== Optimistic locking (MVP) =====
+
+    protected function hasOptimisticLocking(): bool
+    {
+        $lock = $this->getSchema()['locking'] ?? [];
+        return is_array($lock) && isset($lock['type'], $lock['column']) && in_array($lock['type'], ['version','timestamp'], true);
+    }
+
+    /** @return array{type:string,column:string}|array{} */
+    protected function lockingConfig(): array
+    {
+        $lock = $this->getSchema()['locking'] ?? [];
+        return is_array($lock) ? $lock : [];
+    }
+
+    /** Execute an immediate update with optimistic locking when configured. */
+    private function doImmediateUpdateWithLock(int|string $id, array $toStore): void
+    {
+        if (!$this->hasOptimisticLocking()) {
+            // default path
+            $sets = [];
+            $params = [];
+            foreach ($toStore as $col => $val) { $sets[] = "$col = :set_$col"; $params["set_$col"] = $val; }
+            $params['pk'] = $id;
+            $sql = 'UPDATE ' . $this->getTable() . ' SET ' . implode(', ', $sets) . ' WHERE ' . $this->getPrimaryKey() . ' = :pk';
+            $this->connection->execute($sql, $params);
+            return;
+        }
+
+        $cfg = $this->lockingConfig();
+        $col = (string)$cfg['column'];
+        $type = (string)$cfg['type'];
+
+        // Fetch current lock value
+        $pk = $this->getPrimaryKey();
+        $row = $this->connection->query('SELECT ' . $col . ' AS c FROM ' . $this->getTable() . ' WHERE ' . $pk . ' = :pk LIMIT 1', ['pk' => $id]);
+        $current = $row[0]['c'] ?? null;
+
+        // Build SETs
+        $sets = [];
+        $params = [];
+        foreach ($toStore as $c => $v) { $sets[] = "$c = :set_$c"; $params["set_$c"] = $v; }
+
+        if ($type === 'version') {
+            // bump version
+            $sets[] = $col . ' = ' . $col . ' + 1';
+        }
+
+        // WHERE with lock compare
+        $params['pk'] = $id;
+        $where = $pk . ' = :pk';
+        if ($current !== null) {
+            $params['exp_lock'] = $current;
+            $where .= ' AND ' . $col . ' = :exp_lock';
+        }
+
+        $sql = 'UPDATE ' . $this->getTable() . ' SET ' . implode(', ', $sets) . ' WHERE ' . $where;
+        $affected = $this->connection->execute($sql, $params);
+        if ($current !== null && $affected === 0) {
+            throw new \Pairity\Orm\OptimisticLockException('Optimistic lock failed for ' . static::class . ' id=' . (string)$id);
+        }
     }
 
     // ===== Soft delete toggles =====

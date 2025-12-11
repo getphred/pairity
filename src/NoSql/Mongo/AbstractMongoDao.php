@@ -4,6 +4,7 @@ namespace Pairity\NoSql\Mongo;
 
 use Pairity\Model\AbstractDto;
 use Pairity\Orm\UnitOfWork;
+use Pairity\Events\Events;
 
 /**
  * Base DAO for MongoDB collections returning DTOs.
@@ -121,6 +122,8 @@ abstract class AbstractMongoDao
     public function findOneBy(array|Filter $filter): ?AbstractDto
     {
         $filterArr = $this->normalizeFilterInput($filter);
+        // Events: dao.beforeFind (Mongo) — allow filter mutation
+        try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'filter' => &$filterArr]; Events::dispatcher()->dispatch('dao.beforeFind', $ev); } catch (\Throwable) {}
         $this->applyRuntimeScopesToFilter($filterArr);
         $opts = $this->buildOptions();
         $opts['limit'] = 1;
@@ -128,7 +131,9 @@ abstract class AbstractMongoDao
         $this->resetModifiers();
         $this->resetRuntimeScopes();
         $row = $docs[0] ?? null;
-        return $row ? $this->hydrate($row) : null;
+        $dto = $row ? $this->hydrate($row) : null;
+        try { $payload = ['dao' => $this, 'collection' => $this->collection(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterFind', $payload); } catch (\Throwable) {}
+        return $dto;
     }
 
     /**
@@ -139,6 +144,8 @@ abstract class AbstractMongoDao
     public function findAllBy(array|Filter $filter = [], array $options = []): array
     {
         $filterArr = $this->normalizeFilterInput($filter);
+        // Events: dao.beforeFind (Mongo)
+        try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'filter' => &$filterArr]; Events::dispatcher()->dispatch('dao.beforeFind', $ev); } catch (\Throwable) {}
         $this->applyRuntimeScopesToFilter($filterArr);
         $opts = $this->buildOptions();
         // external override/merge
@@ -150,6 +157,7 @@ abstract class AbstractMongoDao
         }
         $this->resetModifiers();
         $this->resetRuntimeScopes();
+        try { $payload = ['dao' => $this, 'collection' => $this->collection(), 'dtos' => $dtos]; Events::dispatcher()->dispatch('dao.afterFind', $payload); } catch (\Throwable) {}
         return $dtos;
     }
 
@@ -169,10 +177,14 @@ abstract class AbstractMongoDao
     public function insert(array $data): AbstractDto
     {
         // Inserts remain immediate to obtain a real id, even under UoW
+        // Events: dao.beforeInsert (Mongo) — allow mutation of $data
+        try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeInsert', $ev); } catch (\Throwable) {}
         $id = UnitOfWork::suspendDuring(function () use ($data) {
             return $this->connection->insertOne($this->databaseName(), $this->collection(), $data);
         });
-        return $this->findById($id) ?? $this->hydrate(array_merge($data, ['_id' => $id]));
+        $dto = $this->findById($id) ?? $this->hydrate(array_merge($data, ['_id' => $id]));
+        try { $payload = ['dao' => $this, 'collection' => $this->collection(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterInsert', $payload); } catch (\Throwable) {}
+        return $dto;
     }
 
     /** @param array<string,mixed> $data */
@@ -181,6 +193,8 @@ abstract class AbstractMongoDao
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id; $payload = $data;
+            // Events: dao.beforeUpdate (Mongo)
+            try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'id' => $id, 'data' => &$payload]; Events::dispatcher()->dispatch('dao.beforeUpdate', $ev); } catch (\Throwable) {}
             $uow->enqueueWithMeta($conn, [
                 'type' => 'update',
                 'mode' => 'byId',
@@ -188,15 +202,21 @@ abstract class AbstractMongoDao
                 'id'   => (string)$id,
             ], function () use ($self, $theId, $payload) {
                 UnitOfWork::suspendDuring(function () use ($self, $theId, $payload) {
-                    $self->getConnection()->updateOne($self->databaseName(), $self->collection(), ['_id' => $theId], ['$set' => $payload]);
+                    $self->doImmediateUpdateWithLock($theId, $payload);
                 });
             });
             $base = $this->findById($id)?->toArray(false) ?? [];
             $result = array_merge($base, $data, ['_id' => $id]);
-            return $this->hydrate($result);
+            $dto = $this->hydrate($result);
+            try { $p = ['dao' => $this, 'collection' => $this->collection(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterUpdate', $p); } catch (\Throwable) {}
+            return $dto;
         }
-        $this->connection->updateOne($this->databaseName(), $this->collection(), ['_id' => $id], ['$set' => $data]);
-        return $this->findById($id) ?? $this->hydrate(array_merge($data, ['_id' => $id]));
+        // Events: dao.beforeUpdate (Mongo)
+        try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'id' => $id, 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeUpdate', $ev); } catch (\Throwable) {}
+        $this->doImmediateUpdateWithLock($id, $data);
+        $dto = $this->findById($id) ?? $this->hydrate(array_merge($data, ['_id' => $id]));
+        try { $p = ['dao' => $this, 'collection' => $this->collection(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterUpdate', $p); } catch (\Throwable) {}
+        return $dto;
     }
 
     public function deleteById(string $id): int
@@ -204,6 +224,7 @@ abstract class AbstractMongoDao
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id;
+            try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'id' => $id]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
             $uow->enqueueWithMeta($conn, [
                 'type' => 'delete',
                 'mode' => 'byId',
@@ -216,7 +237,10 @@ abstract class AbstractMongoDao
             });
             return 0;
         }
-        return $this->connection->deleteOne($this->databaseName(), $this->collection(), ['_id' => $id]);
+        try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'id' => $id]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
+        $affected = $this->connection->deleteOne($this->databaseName(), $this->collection(), ['_id' => $id]);
+        try { $p = ['dao' => $this, 'collection' => $this->collection(), 'id' => $id, 'affected' => $affected]; Events::dispatcher()->dispatch('dao.afterDelete', $p); } catch (\Throwable) {}
+        return $affected;
     }
 
     /** @param array<string,mixed>|Filter $filter */
@@ -225,6 +249,7 @@ abstract class AbstractMongoDao
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $flt = $this->normalizeFilterInput($filter);
+            try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'filter' => &$flt]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
             $uow->enqueueWithMeta($conn, [
                 'type' => 'delete',
                 'mode' => 'byCriteria',
@@ -239,8 +264,10 @@ abstract class AbstractMongoDao
         }
         // For MVP provide deleteOne semantic; bulk deletes could be added later
         $flt = $this->normalizeFilterInput($filter);
+        try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'filter' => &$flt]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
         $this->applyRuntimeScopesToFilter($flt);
         $res = $this->connection->deleteOne($this->databaseName(), $this->collection(), $flt);
+        try { $p = ['dao' => $this, 'collection' => $this->collection(), 'filter' => $flt, 'affected' => $res]; Events::dispatcher()->dispatch('dao.afterDelete', $p); } catch (\Throwable) {}
         $this->resetRuntimeScopes();
         return $res;
     }
@@ -335,6 +362,8 @@ abstract class AbstractMongoDao
             $idVal = $doc['_id'] ?? null;
             if ($idVal !== null) {
                 $uow->attach(static::class, (string)$idVal, $dto);
+                // Bind this DAO to allow snapshot diffing to emit updates
+                $uow->bindDao(static::class, (string)$idVal, $this);
             }
         }
         return $dto;
@@ -655,5 +684,40 @@ abstract class AbstractMongoDao
     private function resetRuntimeScopes(): void
     {
         $this->runtimeScopes = [];
+    }
+
+    // ===== Optimistic locking (MVP) for Mongo =====
+    /**
+     * Override to enable locking. Example return:
+     * ['type' => 'version', 'column' => '_v']
+     * Currently only 'version' (numeric increment) is supported for Mongo.
+     * @return array{type:string,column:string}|array{}
+     */
+    protected function locking(): array { return []; }
+
+    private function hasOptimisticLocking(): bool
+    {
+        $cfg = $this->locking();
+        return is_array($cfg) && isset($cfg['type'], $cfg['column']) && $cfg['type'] === 'version' && is_string($cfg['column']) && $cfg['column'] !== '';
+    }
+
+    private function doImmediateUpdateWithLock(string $id, array $payload): void
+    {
+        if (!$this->hasOptimisticLocking()) {
+            $this->connection->updateOne($this->databaseName(), $this->collection(), ['_id' => $id], ['$set' => $payload]);
+            return;
+        }
+        $cfg = $this->locking();
+        $col = (string)$cfg['column'];
+        // Fetch current version
+        $docs = $this->connection->find($this->databaseName(), $this->collection(), ['_id' => $id], ['limit' => 1, 'projection' => [$col => 1]]);
+        $cur = $docs[0][$col] ?? null;
+        $filter = ['_id' => $id];
+        if ($cur !== null) { $filter[$col] = $cur; }
+        $update = ['$set' => $payload, '$inc' => [$col => 1]];
+        $modified = $this->connection->updateOne($this->databaseName(), $this->collection(), $filter, $update);
+        if ($cur !== null && $modified === 0) {
+            throw new \Pairity\Orm\OptimisticLockException('Optimistic lock failed for ' . static::class . ' id=' . $id);
+        }
     }
 }
