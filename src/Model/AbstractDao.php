@@ -143,7 +143,15 @@ abstract class AbstractDao implements DaoInterface
     public function findOneBy(array $criteria): ?AbstractDto
     {
         // Events: dao.beforeFind (criteria may be mutated)
-        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => &$criteria]; Events::dispatcher()->dispatch('dao.beforeFind', $ev); } catch (\Throwable) {}
+        try {
+            $ev = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'criteria' => &$criteria,
+            ];
+            Events::dispatcher()->dispatch('dao.beforeFind', $ev);
+        } catch (\Throwable) {
+        }
         $criteria = $this->applyDefaultScopes($criteria);
         $this->applyRuntimeScopesToCriteria($criteria);
         [$where, $bindings] = $this->buildWhere($criteria);
@@ -167,7 +175,15 @@ abstract class AbstractDao implements DaoInterface
         $this->eagerStrategy = null; // reset
         $this->withStrategies = [];
         // Events: dao.afterFind
-        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterFind', $payload); } catch (\Throwable) {}
+        try {
+            $payload = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'dto' => $dto,
+            ];
+            Events::dispatcher()->dispatch('dao.afterFind', $payload);
+        } catch (\Throwable) {
+        }
         return $dto;
     }
 
@@ -190,7 +206,15 @@ abstract class AbstractDao implements DaoInterface
     public function findAllBy(array $criteria = []): array
     {
         // Events: dao.beforeFind (criteria may be mutated)
-        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'criteria' => &$criteria]; Events::dispatcher()->dispatch('dao.beforeFind', $ev); } catch (\Throwable) {}
+        try {
+            $ev = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'criteria' => &$criteria,
+            ];
+            Events::dispatcher()->dispatch('dao.beforeFind', $ev);
+        } catch (\Throwable) {
+        }
         $criteria = $this->applyDefaultScopes($criteria);
         $this->applyRuntimeScopesToCriteria($criteria);
         [$where, $bindings] = $this->buildWhere($criteria);
@@ -212,7 +236,15 @@ abstract class AbstractDao implements DaoInterface
         $this->eagerStrategy = null; // reset
         $this->withStrategies = [];
         // Events: dao.afterFind (list)
-        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dtos' => $dtos]; Events::dispatcher()->dispatch('dao.afterFind', $payload); } catch (\Throwable) {}
+        try {
+            $payload = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'dtos' => $dtos,
+            ];
+            Events::dispatcher()->dispatch('dao.afterFind', $payload);
+        } catch (\Throwable) {
+        }
         return $dtos;
     }
 
@@ -300,7 +332,15 @@ abstract class AbstractDao implements DaoInterface
             throw new \InvalidArgumentException('insert() requires non-empty data');
         }
         // Events: dao.beforeInsert (allow mutation of $data)
-        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeInsert', $ev); } catch (\Throwable) {}
+        try {
+            $ev = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'data' => &$data,
+            ];
+            Events::dispatcher()->dispatch('dao.beforeInsert', $ev);
+        } catch (\Throwable) {
+        }
         $data = $this->prepareForInsert($data);
         $cols = array_keys($data);
         $placeholders = array_map(fn($c) => ':' . $c, $cols);
@@ -310,12 +350,28 @@ abstract class AbstractDao implements DaoInterface
         $pk = $this->getPrimaryKey();
         if ($id !== null) {
             $dto = $this->findById($id) ?? $this->hydrate(array_merge($data, [$pk => $id]));
-            try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterInsert', $payload); } catch (\Throwable) {}
+            try {
+                $payload = [
+                    'dao' => $this,
+                    'table' => $this->getTable(),
+                    'dto' => $dto,
+                ];
+                Events::dispatcher()->dispatch('dao.afterInsert', $payload);
+            } catch (\Throwable) {
+            }
             return $dto;
         }
         // Fallback when lastInsertId is unavailable: return hydrated DTO from provided data
         $dto = $this->hydrate($this->castRowFromStorage($data));
-        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterInsert', $payload); } catch (\Throwable) {}
+        try {
+            $payload = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'dto' => $dto,
+            ];
+            Events::dispatcher()->dispatch('dao.afterInsert', $payload);
+        } catch (\Throwable) {
+        }
         return $dto;
     }
 
@@ -330,7 +386,16 @@ abstract class AbstractDao implements DaoInterface
                 throw new \InvalidArgumentException('No data provided to update and record not found');
             }
             // Events: dao.beforeUpdate (mutate $data)
-            try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id, 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeUpdate', $ev); } catch (\Throwable) {}
+            try {
+                $ev = [
+                    'dao' => $this,
+                    'table' => $this->getTable(),
+                    'id' => $id,
+                    'data' => &$data,
+                ];
+                Events::dispatcher()->dispatch('dao.beforeUpdate', $ev);
+            } catch (\Throwable) {
+            }
             $toStore = $this->prepareForUpdate($data);
             $self = $this;
             $conn = $this->connection;
@@ -349,7 +414,15 @@ abstract class AbstractDao implements DaoInterface
             $pk = $this->getPrimaryKey();
             $result = array_merge($base, $data, [$pk => $id]);
             $dto = $this->hydrate($this->castRowFromStorage($result));
-            try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterUpdate', $payload); } catch (\Throwable) {}
+            try {
+                $payload = [
+                    'dao' => $this,
+                    'table' => $this->getTable(),
+                    'dto' => $dto,
+                ];
+                Events::dispatcher()->dispatch('dao.afterUpdate', $payload);
+            } catch (\Throwable) {
+            }
             return $dto;
         }
 
@@ -359,17 +432,42 @@ abstract class AbstractDao implements DaoInterface
             throw new \InvalidArgumentException('No data provided to update and record not found');
         }
         // Events: dao.beforeUpdate
-        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id, 'data' => &$data]; Events::dispatcher()->dispatch('dao.beforeUpdate', $ev); } catch (\Throwable) {}
+        try {
+            $ev = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'id' => $id,
+                'data' => &$data,
+            ];
+            Events::dispatcher()->dispatch('dao.beforeUpdate', $ev);
+        } catch (\Throwable) {
+        }
         $data = $this->prepareForUpdate($data);
         $this->doImmediateUpdateWithLock($id, $data);
         $updated = $this->findById($id);
         if ($updated === null) {
             $pk = $this->getPrimaryKey();
             $dto = $this->hydrate($this->castRowFromStorage(array_merge($data, [$pk => $id])));
-            try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterUpdate', $payload); } catch (\Throwable) {}
+            try {
+                $payload = [
+                    'dao' => $this,
+                    'table' => $this->getTable(),
+                    'dto' => $dto,
+                ];
+                Events::dispatcher()->dispatch('dao.afterUpdate', $payload);
+            } catch (\Throwable) {
+            }
             return $dto;
         }
-        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'dto' => $updated]; Events::dispatcher()->dispatch('dao.afterUpdate', $payload); } catch (\Throwable) {}
+        try {
+            $payload = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'dto' => $updated,
+            ];
+            Events::dispatcher()->dispatch('dao.afterUpdate', $payload);
+        } catch (\Throwable) {
+        }
         return $updated;
     }
 
@@ -378,7 +476,15 @@ abstract class AbstractDao implements DaoInterface
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id;
-            try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
+            try {
+                $ev = [
+                    'dao' => $this,
+                    'table' => $this->getTable(),
+                    'id' => $id,
+                ];
+                Events::dispatcher()->dispatch('dao.beforeDelete', $ev);
+            } catch (\Throwable) {
+            }
             $uow->enqueueWithMeta($conn, [
                 'type' => 'delete',
                 'mode' => 'byId',
@@ -390,7 +496,15 @@ abstract class AbstractDao implements DaoInterface
             // deferred; immediate affected count unknown
             return 0;
         }
-        try { $ev = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id]; Events::dispatcher()->dispatch('dao.beforeDelete', $ev); } catch (\Throwable) {}
+        try {
+            $ev = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'id' => $id,
+            ];
+            Events::dispatcher()->dispatch('dao.beforeDelete', $ev);
+        } catch (\Throwable) {
+        }
         if ($this->hasSoftDeletes()) {
             $columns = $this->softDeleteConfig();
             $deletedAt = $columns['deletedAt'] ?? 'deleted_at';
@@ -400,7 +514,16 @@ abstract class AbstractDao implements DaoInterface
         }
         $sql = 'DELETE FROM ' . $this->getTable() . ' WHERE ' . $this->getPrimaryKey() . ' = :pk';
         $affected = $this->connection->execute($sql, ['pk' => $id]);
-        try { $payload = ['dao' => $this, 'table' => $this->getTable(), 'id' => $id, 'affected' => $affected]; Events::dispatcher()->dispatch('dao.afterDelete', $payload); } catch (\Throwable) {}
+        try {
+            $payload = [
+                'dao' => $this,
+                'table' => $this->getTable(),
+                'id' => $id,
+                'affected' => $affected,
+            ];
+            Events::dispatcher()->dispatch('dao.afterDelete', $payload);
+        } catch (\Throwable) {
+        }
         return $affected;
     }
 

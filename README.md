@@ -15,7 +15,7 @@ MIT
 
 ## Installation
 
-- Requirements: PHP >= 8.1, PDO extension for your database(s)
+- Requirements: PHP >= 8.2, PDO extension for your database(s)
 - Install via Composer:
 
 ```
