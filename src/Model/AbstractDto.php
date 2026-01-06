@@ -4,7 +4,7 @@ namespace Pairity\Model;
 
 use Pairity\Contracts\DtoInterface;
 
-abstract class AbstractDto implements DtoInterface
+abstract class AbstractDto implements DtoInterface, \Serializable
 {
     /** @var array<string,mixed> */
     protected array $attributes = [];
@@ -21,6 +21,26 @@ abstract class AbstractDto implements DtoInterface
             }
             $this->attributes[$key] = $value;
         }
+    }
+
+    public function serialize(): ?string
+    {
+        return serialize($this->attributes);
+    }
+
+    public function unserialize(string $data): void
+    {
+        $this->attributes = unserialize($data);
+    }
+
+    public function __serialize(): array
+    {
+        return $this->attributes;
+    }
+
+    public function __unserialize(array $data): void
+    {
+        $this->attributes = $data;
     }
 
     /** @param array<string,mixed> $data */

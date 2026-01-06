@@ -42,4 +42,12 @@ interface ConnectionInterface
      * Get last inserted ID if supported.
      */
     public function lastInsertId(): ?string;
+
+    /**
+     * Run a callback without performing any persistent changes, returning the logged SQL.
+     *
+     * @param callable($this):void $callback
+     * @return array<int, array{sql: string, params: array<string, mixed>}>
+     */
+    public function pretend(callable $callback): array;
 }

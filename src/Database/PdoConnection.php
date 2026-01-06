@@ -14,6 +14,10 @@ class PdoConnection implements ConnectionInterface
     private int $stmtCacheSize = 100; // LRU bound
     /** @var null|callable */
     private $queryLogger = null; // function(string $sql, array $params, float $ms): void
+    /** @var bool */
+    private bool $pretending = false;
+    /** @var array<int, array{sql: string, params: array<string, mixed>}> */
+    private array $pretendLog = [];
 
     public function __construct(PDO $pdo)
     {
@@ -63,6 +67,10 @@ class PdoConnection implements ConnectionInterface
 
     public function query(string $sql, array $params = []): array
     {
+        if ($this->pretending) {
+            $this->pretendLog[] = ['sql' => $sql, 'params' => $params];
+            return [];
+        }
         $t0 = microtime(true);
         $stmt = $this->prepare($sql);
         $stmt->execute($params);
@@ -76,6 +84,10 @@ class PdoConnection implements ConnectionInterface
 
     public function execute(string $sql, array $params = []): int
     {
+        if ($this->pretending) {
+            $this->pretendLog[] = ['sql' => $sql, 'params' => $params];
+            return 0;
+        }
         $t0 = microtime(true);
         $stmt = $this->prepare($sql);
         $stmt->execute($params);
@@ -89,6 +101,9 @@ class PdoConnection implements ConnectionInterface
 
     public function transaction(callable $callback): mixed
     {
+        if ($this->pretending) {
+            return $callback($this);
+        }
         $this->pdo->beginTransaction();
         try {
             $result = $callback($this);
@@ -112,5 +127,19 @@ class PdoConnection implements ConnectionInterface
         } catch (PDOException $e) {
             return null;
         }
+    }
+
+    public function pretend(callable $callback): array
+    {
+        $this->pretending = true;
+        $this->pretendLog = [];
+
+        try {
+            $callback($this);
+        } finally {
+            $this->pretending = false;
+        }
+
+        return $this->pretendLog;
     }
 }

@@ -33,7 +33,22 @@ class Migrator
      * @param array<string,MigrationInterface> $migrations An ordered map of name => instance
      * @return array<int,string> List of applied migration names
      */
-    public function migrate(array $migrations): array
+    public function migrate(array $migrations, bool $pretend = false): array
+    {
+        if ($pretend) {
+            return $this->connection->pretend(function () use ($migrations) {
+                $this->runMigrations($migrations);
+            });
+        }
+
+        return $this->runMigrations($migrations);
+    }
+
+    /**
+     * @param array<string,MigrationInterface> $migrations
+     * @return array<int,string>|array<int, array{sql: string, params: array<string, mixed>}>
+     */
+    private function runMigrations(array $migrations): array
     {
         $this->repository->ensureTable();
         $ran = array_flip($this->repository->getRan());
@@ -59,9 +74,23 @@ class Migrator
     /**
      * Roll back the last batch (or N steps of batches).
      *
-     * @return array<int,string> List of rolled back migration names
+     * @return array<int,string>|array<int, array{sql: string, params: array<string, mixed>}>
      */
-    public function rollback(int $steps = 1): array
+    public function rollback(int $steps = 1, bool $pretend = false): array
+    {
+        if ($pretend) {
+            return $this->connection->pretend(function () use ($steps) {
+                $this->runRollback($steps);
+            });
+        }
+
+        return $this->runRollback($steps);
+    }
+
+    /**
+     * @return array<int,string>
+     */
+    private function runRollback(int $steps): array
     {
         $this->repository->ensureTable();
         $rolled = [];

@@ -4,12 +4,16 @@ namespace Pairity\Model;
 
 use Pairity\Contracts\ConnectionInterface;
 use Pairity\Contracts\DaoInterface;
+use Pairity\Contracts\CacheableDaoInterface;
+use Pairity\Orm\Traits\CanCache;
 use Pairity\Orm\UnitOfWork;
 use Pairity\Model\Casting\CasterInterface;
 use Pairity\Events\Events;
 
-abstract class AbstractDao implements DaoInterface
+abstract class AbstractDao implements DaoInterface, CacheableDaoInterface
 {
+    use CanCache;
+
     protected ConnectionInterface $connection;
     protected string $primaryKey = 'id';
     /** @var array<int,string>|null */
@@ -142,6 +146,25 @@ abstract class AbstractDao implements DaoInterface
     /** @param array<string,mixed> $criteria */
     public function findOneBy(array $criteria): ?AbstractDto
     {
+        $cacheKey = null;
+        if ($this->cache !== null && empty($this->with) && $this->selectedFields === null && empty($this->runtimeScopes)) {
+            $cacheKey = $this->getCacheKeyForCriteria($criteria);
+            $cached = $this->getFromCache($cacheKey);
+            if ($cached instanceof AbstractDto) {
+                $uow = UnitOfWork::current();
+                if ($uow && !UnitOfWork::isSuspended()) {
+                    $idCol = $this->getPrimaryKey();
+                    $id = (string)$cached->$idCol;
+                    $managed = $uow->get(static::class, $id);
+                    if ($managed) {
+                        return $managed;
+                    }
+                    $uow->attach(static::class, $id, $cached);
+                }
+                return $cached;
+            }
+        }
+
         // Events: dao.beforeFind (criteria may be mutated)
         try {
             $ev = [
@@ -184,6 +207,13 @@ abstract class AbstractDao implements DaoInterface
             Events::dispatcher()->dispatch('dao.afterFind', $payload);
         } catch (\Throwable) {
         }
+
+        if ($dto && $cacheKey) {
+            $this->putInCache($cacheKey, $dto);
+            $idCol = $this->getPrimaryKey();
+            $this->putInCache($this->getCacheKeyForId($dto->$idCol), $dto);
+        }
+
         return $dto;
     }
 
@@ -196,7 +226,26 @@ abstract class AbstractDao implements DaoInterface
                 return $managed;
             }
         }
-        return $this->findOneBy([$this->getPrimaryKey() => $id]);
+
+        if ($this->cache !== null && empty($this->with) && $this->selectedFields === null && empty($this->runtimeScopes)) {
+            $cacheKey = $this->getCacheKeyForId($id);
+            $cached = $this->getFromCache($cacheKey);
+            if ($cached instanceof AbstractDto) {
+                if ($uow && !UnitOfWork::isSuspended()) {
+                    $uow->attach(static::class, (string)$id, $cached);
+                }
+                return $cached;
+            }
+        }
+
+        $dto = $this->findOneBy([$this->getPrimaryKey() => $id]);
+        
+        // Ensure it's cached by ID specifically if findOneBy didn't do it or if it was fetched from DB
+        if ($dto && $this->cache !== null && empty($this->with) && $this->selectedFields === null && empty($this->runtimeScopes)) {
+            $this->putInCache($this->getCacheKeyForId($id), $dto);
+        }
+        
+        return $dto;
     }
 
     /**
@@ -205,6 +254,33 @@ abstract class AbstractDao implements DaoInterface
      */
     public function findAllBy(array $criteria = []): array
     {
+        $cacheKey = null;
+        if ($this->cache !== null && empty($this->with) && $this->selectedFields === null && empty($this->runtimeScopes)) {
+            $cacheKey = $this->getCacheKeyForCriteria($criteria);
+            $cached = $this->getFromCache($cacheKey);
+            if (is_array($cached)) {
+                $uow = UnitOfWork::current();
+                $idCol = $this->getPrimaryKey();
+                $out = [];
+                foreach ($cached as $dto) {
+                    if (!$dto instanceof AbstractDto) { continue; }
+                    if ($uow && !UnitOfWork::isSuspended()) {
+                        $id = (string)$dto->$idCol;
+                        $managed = $uow->get(static::class, $id);
+                        if ($managed) {
+                            $out[] = $managed;
+                        } else {
+                            $uow->attach(static::class, $id, $dto);
+                            $out[] = $dto;
+                        }
+                    } else {
+                        $out[] = $dto;
+                    }
+                }
+                return $out;
+            }
+        }
+
         // Events: dao.beforeFind (criteria may be mutated)
         try {
             $ev = [
@@ -245,6 +321,16 @@ abstract class AbstractDao implements DaoInterface
             Events::dispatcher()->dispatch('dao.afterFind', $payload);
         } catch (\Throwable) {
         }
+
+        if ($cacheKey && !empty($dtos)) {
+            $this->putInCache($cacheKey, $dtos);
+            // We could also cache each individual DTO by ID here for warming
+            $idCol = $this->getPrimaryKey();
+            foreach ($dtos as $dto) {
+                $this->putInCache($this->getCacheKeyForId($dto->$idCol), $dto);
+            }
+        }
+
         return $dtos;
     }
 
@@ -378,6 +464,8 @@ abstract class AbstractDao implements DaoInterface
     /** @param array<string,mixed> $data */
     public function update(int|string $id, array $data): AbstractDto
     {
+        $this->removeFromCache($this->getCacheKeyForId($id));
+
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             // Defer execution; return a synthesized DTO
@@ -473,6 +561,8 @@ abstract class AbstractDao implements DaoInterface
 
     public function deleteById(int|string $id): int
     {
+        $this->removeFromCache($this->getCacheKeyForId($id));
+
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id;
@@ -530,6 +620,10 @@ abstract class AbstractDao implements DaoInterface
     /** @param array<string,mixed> $criteria */
     public function deleteBy(array $criteria): int
     {
+        if ($this->cache !== null) {
+            $this->clearCache();
+        }
+
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $crit = $criteria;
@@ -571,6 +665,10 @@ abstract class AbstractDao implements DaoInterface
      */
     public function updateBy(array $criteria, array $data): int
     {
+        if ($this->cache !== null) {
+            $this->clearCache();
+        }
+
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             if (empty($data)) { return 0; }
