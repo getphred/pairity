@@ -2,6 +2,8 @@
 
 namespace Pairity\NoSql\Mongo;
 
+use Pairity\Contracts\CacheableDaoInterface;
+use Pairity\Orm\Traits\CanCache;
 use Pairity\Model\AbstractDto;
 use Pairity\Orm\UnitOfWork;
 use Pairity\Events\Events;
@@ -11,8 +13,10 @@ use Pairity\Events\Events;
  *
  * Usage: extend and implement collection() + dtoClass().
  */
-abstract class AbstractMongoDao
+abstract class AbstractMongoDao implements CacheableDaoInterface
 {
+    use CanCache;
+
     protected MongoConnectionInterface $connection;
 
     /** @var array<int,string>|null */
@@ -52,6 +56,11 @@ abstract class AbstractMongoDao
     public function __construct(MongoConnectionInterface $connection)
     {
         $this->connection = $connection;
+    }
+
+    public function getTable(): string
+    {
+        return $this->collection();
     }
 
     /** Collection name (e.g., "users"). */
@@ -144,6 +153,25 @@ abstract class AbstractMongoDao
     public function findOneBy(array|Filter $filter): ?AbstractDto
     {
         $filterArr = $this->normalizeFilterInput($filter);
+
+        $cacheKey = null;
+        if ($this->cache !== null && empty($this->with) && $this->projection === null && empty($this->runtimeScopes)) {
+            $cacheKey = $this->getCacheKeyForCriteria($filterArr);
+            $cached = $this->getFromCache($cacheKey);
+            if ($cached instanceof AbstractDto) {
+                $uow = UnitOfWork::current();
+                if ($uow && !UnitOfWork::isSuspended()) {
+                    $id = (string)($cached->toArray(false)['_id'] ?? '');
+                    if ($id !== '') {
+                        $managed = $uow->get(static::class, $id);
+                        if ($managed) { return $managed; }
+                        $uow->attach(static::class, $id, $cached);
+                    }
+                }
+                return $cached;
+            }
+        }
+
         // Events: dao.beforeFind (Mongo) — allow filter mutation
         try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'filter' => &$filterArr]; Events::dispatcher()->dispatch('dao.beforeFind', $ev); } catch (\Throwable) {}
         $this->applyRuntimeScopesToFilter($filterArr);
@@ -155,6 +183,15 @@ abstract class AbstractMongoDao
         $row = $docs[0] ?? null;
         $dto = $row ? $this->hydrate($row) : null;
         try { $payload = ['dao' => $this, 'collection' => $this->collection(), 'dto' => $dto]; Events::dispatcher()->dispatch('dao.afterFind', $payload); } catch (\Throwable) {}
+
+        if ($dto && $cacheKey) {
+            $this->putInCache($cacheKey, $dto);
+            $id = (string)($dto->toArray(false)['_id'] ?? '');
+            if ($id !== '') {
+                $this->putInCache($this->getCacheKeyForId($id), $dto);
+            }
+        }
+
         return $dto;
     }
 
@@ -166,6 +203,33 @@ abstract class AbstractMongoDao
     public function findAllBy(array|Filter $filter = [], array $options = []): array
     {
         $filterArr = $this->normalizeFilterInput($filter);
+
+        $cacheKey = null;
+        if ($this->cache !== null && empty($this->with) && $this->projection === null && empty($this->runtimeScopes)) {
+            $cacheKey = $this->getCacheKeyForCriteria($filterArr);
+            $cached = $this->getFromCache($cacheKey);
+            if (is_array($cached)) {
+                $uow = UnitOfWork::current();
+                $out = [];
+                foreach ($cached as $dto) {
+                    if (!$dto instanceof AbstractDto) { continue; }
+                    $id = (string)($dto->toArray(false)['_id'] ?? '');
+                    if ($uow && !UnitOfWork::isSuspended() && $id !== '') {
+                        $managed = $uow->get(static::class, $id);
+                        if ($managed) {
+                            $out[] = $managed;
+                        } else {
+                            $uow->attach(static::class, $id, $dto);
+                            $out[] = $dto;
+                        }
+                    } else {
+                        $out[] = $dto;
+                    }
+                }
+                return $out;
+            }
+        }
+
         // Events: dao.beforeFind (Mongo)
         try { $ev = ['dao' => $this, 'collection' => $this->collection(), 'filter' => &$filterArr]; Events::dispatcher()->dispatch('dao.beforeFind', $ev); } catch (\Throwable) {}
         $this->applyRuntimeScopesToFilter($filterArr);
@@ -180,6 +244,17 @@ abstract class AbstractMongoDao
         $this->resetModifiers();
         $this->resetRuntimeScopes();
         try { $payload = ['dao' => $this, 'collection' => $this->collection(), 'dtos' => $dtos]; Events::dispatcher()->dispatch('dao.afterFind', $payload); } catch (\Throwable) {}
+
+        if ($cacheKey && !empty($dtos)) {
+            $this->putInCache($cacheKey, $dtos);
+            foreach ($dtos as $dto) {
+                $id = (string)($dto->toArray(false)['_id'] ?? '');
+                if ($id !== '') {
+                    $this->putInCache($this->getCacheKeyForId($id), $dto);
+                }
+            }
+        }
+
         return $dtos;
     }
 
@@ -192,7 +267,25 @@ abstract class AbstractMongoDao
                 return $managed;
             }
         }
-        return $this->findOneBy(['_id' => $id]);
+
+        if ($this->cache !== null && empty($this->with) && $this->projection === null && empty($this->runtimeScopes)) {
+            $cacheKey = $this->getCacheKeyForId($id);
+            $cached = $this->getFromCache($cacheKey);
+            if ($cached instanceof AbstractDto) {
+                if ($uow && !UnitOfWork::isSuspended()) {
+                    $uow->attach(static::class, (string)$id, $cached);
+                }
+                return $cached;
+            }
+        }
+
+        $dto = $this->findOneBy(['_id' => $id]);
+
+        if ($dto && $this->cache !== null && empty($this->with) && $this->projection === null && empty($this->runtimeScopes)) {
+            $this->putInCache($this->getCacheKeyForId($id), $dto);
+        }
+
+        return $dto;
     }
 
     /** @param array<string,mixed> $data */
@@ -212,6 +305,8 @@ abstract class AbstractMongoDao
     /** @param array<string,mixed> $data */
     public function update(string $id, array $data): AbstractDto
     {
+        $this->removeFromCache($this->getCacheKeyForId($id));
+
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id; $payload = $data;
@@ -243,6 +338,8 @@ abstract class AbstractMongoDao
 
     public function deleteById(string $id): int
     {
+        $this->removeFromCache($this->getCacheKeyForId($id));
+
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $theId = $id;
@@ -268,6 +365,10 @@ abstract class AbstractMongoDao
     /** @param array<string,mixed>|Filter $filter */
     public function deleteBy(array|Filter $filter): int
     {
+        if ($this->cache !== null) {
+            $this->clearCache();
+        }
+
         $uow = UnitOfWork::current();
         if ($uow && !UnitOfWork::isSuspended()) {
             $self = $this; $conn = $this->connection; $flt = $this->normalizeFilterInput($filter);
@@ -297,12 +398,16 @@ abstract class AbstractMongoDao
     /** Upsert by id convenience. */
     public function upsertById(string $id, array $data): string
     {
+        $this->removeFromCache($this->getCacheKeyForId($id));
         return $this->connection->upsertOne($this->databaseName(), $this->collection(), ['_id' => $id], ['$set' => $data]);
     }
 
     /** @param array<string,mixed>|Filter $filter @param array<string,mixed> $update */
     public function upsertBy(array|Filter $filter, array $update): string
     {
+        if ($this->cache !== null) {
+            $this->clearCache();
+        }
         return $this->connection->upsertOne($this->databaseName(), $this->collection(), $this->normalizeFilterInput($filter), $update);
     }
 

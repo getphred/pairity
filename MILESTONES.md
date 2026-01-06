@@ -53,10 +53,10 @@
 - [x] Eager loader IN-batching
 - [x] Metadata memoization
 
-## Milestone 8: Road Ahead
+## Milestone 8: Road Ahead [x]
 - [x] Broader Schema Builder ALTER coverage
 - [x] More dialect nuances for SQL Server/Oracle
 - [x] Enhanced CLI commands
 - [x] Caching layer
-- [ ] Production-ready MongoDB adapter refinements
-- [ ] Documentation and expanded examples
+- [x] Production-ready MongoDB adapter refinements
+- [x] Documentation and expanded examples
