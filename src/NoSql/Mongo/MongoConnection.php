@@ -79,6 +79,47 @@ class MongoConnection implements MongoConnectionInterface
         return $this->getCollection($database, $collection);
     }
 
+    public function upsertOne(string $database, string $collection, array $filter, array $update): string
+    {
+        $id = $this->generateId();
+        if ($this->updateOne($database, $collection, $filter, $update) === 0) {
+            $doc = $filter;
+            if (isset($update['$set'])) {
+                foreach ($update['$set'] as $k => $v) { $doc[$k] = $v; }
+            } else {
+                foreach ($update as $k => $v) { $doc[$k] = $v; }
+            }
+            $doc['_id'] = $doc['_id'] ?? $id;
+            $this->store[$database][$collection][] = $doc;
+            return (string)$doc['_id'];
+        }
+        $found = $this->find($database, $collection, $filter);
+        $first = reset($found);
+        return (string)($first['_id'] ?? '');
+    }
+
+    public function count(string $database, string $collection, array $filter = []): int
+    {
+        $docs = $this->getCollection($database, $collection);
+        $count = 0;
+        foreach ($docs as $doc) {
+            if ($this->matches($doc, $filter)) {
+                $count++;
+            }
+        }
+        return $count;
+    }
+
+    public function withSession(callable $callback): mixed
+    {
+        return $callback($this, null);
+    }
+
+    public function withTransaction(callable $callback): mixed
+    {
+        return $callback($this, null);
+    }
+
     private function &getCollection(string $database, string $collection): array
     {
         if (!isset($this->store[$database][$collection])) {

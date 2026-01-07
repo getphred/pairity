@@ -39,8 +39,8 @@
   },
   "require": {
     "php": "^8.2",
-    "ext-mongodb": "*",
-    "mongodb/mongodb": "^2.0",
+    "ext-mongodb": "^1.20",
+    "mongodb/mongodb": "^1.20",
     "psr/simple-cache": "^3.0"
   },
   "autoload": {

@@ -22,6 +22,9 @@ interface MongoConnectionInterface
     /** @param array<string,mixed> $filter @param array<string,mixed> $update */
     public function upsertOne(string $database, string $collection, array $filter, array $update): string;
 
+    /** @param array<string,mixed> $filter */
+    public function count(string $database, string $collection, array $filter = []): int;
+
     /** Execute a callback with a client session; callback receives the connection instance and session as args. */
     public function withSession(callable $callback): mixed;
 

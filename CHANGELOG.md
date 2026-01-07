@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+#### [0.1.1] - 2026-01-07
+
+##### Changed
+- **MongoDB Downgrade**: Stepped back MongoDB support from `mongodb/mongodb` ^2.0 to ^1.20 for broader compatibility with older `ext-mongodb` environments.
+- **Refactoring**: Simplified `normalizeFilter` in `MongoClientConnection` for better maintainability.
+- **Features**: Added `count()` method to `MongoConnectionInterface` and implementations.
+
 #### [0.1.0] - 2026-01-06
 
 ##### Added

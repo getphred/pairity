@@ -87,6 +87,12 @@ class MongoClientConnection implements MongoConnectionInterface
         return '';
     }
 
+    public function count(string $database, string $collection, array $filter = []): int
+    {
+        $coll = $this->client->selectCollection($database, $collection);
+        return $coll->countDocuments($this->normalizeFilter($filter));
+    }
+
     public function withSession(callable $callback): mixed
     {
         /** @var Session $session */
@@ -118,52 +124,26 @@ class MongoClientConnection implements MongoConnectionInterface
     /** @param array<string,mixed> $filter */
     private function normalizeFilter(array $filter): array
     {
-        // Recursively walk the filter and convert any _id string(s) that look like 24-hex to ObjectId
-        $walker = function (&$node, $key = null) use (&$walker) {
-            if (is_array($node)) {
-                foreach ($node as $k => &$v) {
-                    $walker($v, $k);
-                }
-                return;
-            }
-            if ($key === '_id' && is_string($node) && preg_match('/^[a-f\d]{24}$/i', $node)) {
-                try { $node = new ObjectId($node); } catch (\Throwable) {}
-            }
-        };
-
-        $convertIdContainer = function (&$value) use (&$convertIdContainer) {
-            // Handle structures like ['_id' => ['$in' => ['...','...']]]
-            if (is_string($value) && preg_match('/^[a-f\d]{24}$/i', $value)) {
-                try { $value = new ObjectId($value); } catch (\Throwable) {}
-                return;
-            }
+        $normalize = function (&$value, $key) use (&$normalize) {
             if (is_array($value)) {
                 foreach ($value as $k => &$v) {
-                    $convertIdContainer($v);
+                    $normalize($v, $k);
+                }
+                return;
+            }
+
+            if ($key === '_id' && is_string($value) && preg_match('/^[a-f\d]{24}$/i', $value)) {
+                try {
+                    $value = new ObjectId($value);
+                } catch (\Throwable) {
+                    // Ignore invalid ObjectIds
                 }
             }
         };
 
-        // Top-level traversal
         foreach ($filter as $k => &$v) {
-            if ($k === '_id') {
-                $convertIdContainer($v);
-            } elseif (is_array($v)) {
-                // Recurse into nested boolean operators ($and/$or) etc.
-                foreach ($v as $kk => &$vv) {
-                    if ($kk === '_id') {
-                        $convertIdContainer($vv);
-                    } elseif (is_array($vv)) {
-                        foreach ($vv as $kkk => &$vvv) {
-                            if ($kkk === '_id') {
-                                $convertIdContainer($vvv);
-                            }
-                        }
-                    }
-                }
-            }
+            $normalize($v, $k);
         }
-        unset($v);
 
         return $filter;
     }
