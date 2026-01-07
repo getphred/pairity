@@ -55,8 +55,8 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          # Pin ext-mongodb to a 1.20+ line compatible with mongodb/mongodb ^1.20
-          extensions: pdo, pdo_mysql, pdo_sqlite, pdo_pgsql, mongodb-1.20.1
+          # Pin ext-mongodb to a 1.21+ line compatible with mongodb/mongodb ^1.20 (which resolves to 1.21+)
+          extensions: pdo, pdo_mysql, pdo_sqlite, pdo_pgsql, mongodb-1.21.0
           coverage: none
 
       - name: Install dependencies

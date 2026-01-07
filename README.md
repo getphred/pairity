@@ -30,7 +30,7 @@ composer install
 vendor/bin/phpunit
 ```
 
-- **Run MongoDB integration tests** (requires `ext-mongodb >= 1.20` and a reachable server):
+- **Run MongoDB integration tests** (requires `ext-mongodb >= 1.21` and a reachable server):
 ```bash
 MONGO_HOST=127.0.0.1 MONGO_PORT=27017 vendor/bin/phpunit --group mongo-integration
 ```
