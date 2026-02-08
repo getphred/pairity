@@ -44,7 +44,7 @@
   "require": {
     "php": "^8.2",
     "psr/simple-cache": "^3.0",
-    "symfony/yaml": "^8.0",
+    "symfony/yaml": "^7.0",
     "ext-pdo": "*"
   },
   "autoload": {
