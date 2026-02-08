@@ -1,170 +1,178 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Pairity\Schema;
 
+/**
+ * Class Blueprint
+ *
+ * Defines the state of a database table schema.
+ *
+ * @package Pairity\Schema
+ */
 class Blueprint
 {
-    public string $table;
-    public bool $creating = false;
-    public bool $altering = false;
-    /** @var array<int,ColumnDefinition> */
-    public array $columns = [];
-    /** @var array<int,string> */
-    public array $primary = [];
-    /** @var array<int,array{columns:array<int,string>,name:?string}> */
-    public array $uniques = [];
-    /** @var array<int,array{columns:array<int,string>,name:?string}> */
-    public array $indexes = [];
+    /**
+     * @var array<Column>
+     */
+    protected array $columns = [];
 
-    // Alter support (MVP)
-    /** @var array<int,string> */
-    public array $dropColumns = [];
-    /** @var array<int,array{from:string,to:string}> */
-    public array $renameColumns = [];
-    public ?string $renameTo = null;
-    /** @var array<int,string> */
-    public array $dropUniqueNames = [];
-    /** @var array<int,string> */
-    public array $dropIndexNames = [];
+    /**
+     * @var array<string, mixed>
+     */
+    protected array $options = [
+        'prefix' => null,
+        'tenancy' => false,
+        'inheritance' => null,
+        'morph' => null,
+        'timestamps' => false,
+        'softDeletes' => false,
+        'auditable' => false,
+        'view' => false,
+        'locking' => false,
+    ];
 
-    public function __construct(string $table)
-    {
-        $this->table = $table;
+    /**
+     * @var array<string, array<string>>
+     */
+    protected array $indexes = [];
+
+    /**
+     * @var array<string, array<string, mixed>>
+     */
+    protected array $relations = [];
+
+    /**
+     * Blueprint constructor.
+     *
+     * @param string $tableName
+     */
+    public function __construct(
+        protected string $tableName
+    ) {
     }
 
-    public function create(): void { $this->creating = true; }
-    public function alter(): void { $this->altering = true; }
-
-    // Column helpers
-    public function increments(string $name = 'id'): ColumnDefinition
+    /**
+     * Add a column to the blueprint.
+     *
+     * @param string $name
+     * @param string $type
+     * @param array<string, mixed> $parameters
+     * @return Column
+     */
+    public function addColumn(string $name, string $type, array $parameters = []): Column
     {
-        $col = new ColumnDefinition($name, 'increments');
-        $col->autoIncrement(true);
-        $this->columns[] = $col;
-        $this->primary([$name]);
-        return $col;
+        $column = new Column($name, $type, $parameters);
+        $this->columns[] = $column;
+        return $column;
     }
 
-    public function bigIncrements(string $name = 'id'): ColumnDefinition
+    /**
+     * Get all columns.
+     *
+     * @return array<Column>
+     */
+    public function getColumns(): array
     {
-        $col = new ColumnDefinition($name, 'bigincrements');
-        $col->autoIncrement(true);
-        $this->columns[] = $col;
-        $this->primary([$name]);
-        return $col;
+        return $this->columns;
     }
 
-    public function integer(string $name, bool $unsigned = false): ColumnDefinition
+    /**
+     * Get the table name.
+     *
+     * @return string
+     */
+    public function getTableName(): string
     {
-        $col = new ColumnDefinition($name, 'integer');
-        $col->unsigned($unsigned);
-        $this->columns[] = $col;
-        return $col;
+        return $this->tableName;
     }
 
-    public function bigInteger(string $name, bool $unsigned = false): ColumnDefinition
+    /**
+     * Check if the blueprint represents a database view.
+     *
+     * @return bool
+     */
+    public function isView(): bool
     {
-        $col = new ColumnDefinition($name, 'biginteger');
-        $col->unsigned($unsigned);
-        $this->columns[] = $col;
-        return $col;
+        return (bool) $this->getOption('view', false);
     }
 
-    public function string(string $name, int $length = 255): ColumnDefinition
+    /**
+     * Set a table option.
+     *
+     * @param string $key
+     * @param mixed $value
+     * @return void
+     */
+    public function setOption(string $key, mixed $value): void
     {
-        $col = new ColumnDefinition($name, 'string');
-        $col->length($length);
-        $this->columns[] = $col;
-        return $col;
+        $this->options[$key] = $value;
     }
 
-    public function text(string $name): ColumnDefinition
+    /**
+     * Get a table option.
+     *
+     * @param string $key
+     * @param mixed|null $default
+     * @return mixed
+     */
+    public function getOption(string $key, mixed $default = null): mixed
     {
-        $col = new ColumnDefinition($name, 'text');
-        $this->columns[] = $col;
-        return $col;
+        return $this->options[$key] ?? $default;
     }
 
-    public function boolean(string $name): ColumnDefinition
+    /**
+     * Get all options.
+     *
+     * @return array<string, mixed>
+     */
+    public function getOptions(): array
     {
-        $col = new ColumnDefinition($name, 'boolean');
-        $this->columns[] = $col;
-        return $col;
+        return $this->options;
     }
 
-    public function json(string $name): ColumnDefinition
+    /**
+     * Add an index to the table.
+     *
+     * @param string $name
+     * @param array<string> $columns
+     * @return void
+     */
+    public function addIndex(string $name, array $columns): void
     {
-        $col = new ColumnDefinition($name, 'json');
-        $this->columns[] = $col;
-        return $col;
+        $this->indexes[$name] = $columns;
     }
 
-    public function datetime(string $name): ColumnDefinition
+    /**
+     * Get all indexes.
+     *
+     * @return array<string, array<string>>
+     */
+    public function getIndexes(): array
     {
-        $col = new ColumnDefinition($name, 'datetime');
-        $this->columns[] = $col;
-        return $col;
+        return $this->indexes;
     }
 
-    public function decimal(string $name, int $precision, int $scale = 0): ColumnDefinition
+    /**
+     * Add a relation definition.
+     *
+     * @param string $name
+     * @param array<string, mixed> $definition
+     * @return void
+     */
+    public function addRelation(string $name, array $definition): void
     {
-        $col = new ColumnDefinition($name, 'decimal');
-        $col->precision($precision, $scale);
-        $this->columns[] = $col;
-        return $col;
+        $this->relations[$name] = $definition;
     }
 
-    public function timestamps(string $created = 'created_at', string $updated = 'updated_at'): void
+    /**
+     * Get all relations.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    public function getRelations(): array
     {
-        $this->datetime($created)->nullable();
-        $this->datetime($updated)->nullable();
-    }
-
-    // Index helpers
-    /** @param array<int,string> $columns */
-    public function primary(array $columns): void
-    {
-        $this->primary = $columns;
-    }
-
-    /** @param array<int,string> $columns */
-    public function unique(array $columns, ?string $name = null): void
-    {
-        $this->uniques[] = ['columns' => $columns, 'name' => $name];
-    }
-
-    /** @param array<int,string> $columns */
-    public function index(array $columns, ?string $name = null): void
-    {
-        $this->indexes[] = ['columns' => $columns, 'name' => $name];
-    }
-
-    // Alter helpers (MVP)
-    /** @param array<int,string> $names */
-    public function dropColumn(string ...$names): void
-    {
-        foreach ($names as $n) {
-            if ($n !== '') $this->dropColumns[] = $n;
-        }
-    }
-
-    public function renameColumn(string $from, string $to): void
-    {
-        $this->renameColumns[] = ['from' => $from, 'to' => $to];
-    }
-
-    public function rename(string $newName): void
-    {
-        $this->renameTo = $newName;
-    }
-
-    public function dropUnique(string $name): void
-    {
-        $this->dropUniqueNames[] = $name;
-    }
-
-    public function dropIndex(string $name): void
-    {
-        $this->dropIndexNames[] = $name;
+        return $this->relations;
     }
 }

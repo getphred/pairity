@@ -1,0 +1,10 @@
+/tests export-ignore
+/.github export-ignore
+/examples export-ignore
+/.gitignore export-ignore
+/.junie export-ignore
+/phpunit.xml.dist export-ignore
+/composer.lock export-ignore
+/CHANGELOG.md export-ignore
+/MILESTONES.md export-ignore
+/SPECS.md export-ignore

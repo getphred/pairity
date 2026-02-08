@@ -1,86 +1,177 @@
 <?php
 
+declare(strict_types=1);
+
 namespace Pairity\Schema;
 
-use Closure;
-use Pairity\Contracts\ConnectionInterface;
-use Pairity\Schema\Grammars\Grammar;
-use Pairity\Schema\Grammars\SqliteGrammar;
-
+/**
+ * Class Builder
+ *
+ * Provides a fluent API for defining database table schemas.
+ *
+ * @package Pairity\Schema
+ */
 class Builder
 {
-    private ConnectionInterface $connection;
-    private Grammar $grammar;
+    /**
+     * @var Blueprint
+     */
+    protected Blueprint $blueprint;
 
-    public function __construct(ConnectionInterface $connection, Grammar $grammar)
-    {
-        $this->connection = $connection;
-        $this->grammar = $grammar;
-    }
-
-    public function create(string $table, Closure $callback): void
-    {
-        $blueprint = new Blueprint($table);
-        $blueprint->create();
-        $callback($blueprint);
-        $this->run($this->grammar->compileCreate($blueprint));
-    }
-
-    public function drop(string $table): void
-    {
-        $this->run($this->grammar->compileDrop($table));
-    }
-
-    public function dropIfExists(string $table): void
-    {
-        $this->run($this->grammar->compileDropIfExists($table));
+    /**
+     * Builder constructor.
+     *
+     * @param string $tableName
+     * @param TypeMapper $typeMapper
+     */
+    public function __construct(
+        string $tableName,
+        protected TypeMapper $typeMapper = new TypeMapper()
+    ) {
+        $this->blueprint = new Blueprint($tableName);
     }
 
     /**
-     * Alter an existing table using the blueprint alter helpers.
+     * Add an auto-incrementing big integer primary key.
+     *
+     * @param string $name
+     * @return Column
      */
-    public function table(string $table, Closure $callback): void
+    public function id(string $name = 'id'): Column
     {
-        $blueprint = new Blueprint($table);
-        $blueprint->alter();
-        $callback($blueprint);
-        // If SQLite and operation requires rebuild on legacy versions, perform rebuild
-        if ($this->grammar instanceof SqliteGrammar && ($blueprint->dropColumns || $blueprint->renameColumns)) {
-            $version = $this->detectSqliteVersion();
-            $needsRebuild = false;
-            if ($blueprint->renameColumns) {
-                // RENAME COLUMN requires >= 3.25
-                $needsRebuild = $needsRebuild || version_compare($version, '3.25.0', '<');
-            }
-            if ($blueprint->dropColumns) {
-                // DROP COLUMN requires >= 3.35
-                $needsRebuild = $needsRebuild || version_compare($version, '3.35.0', '<');
-            }
-            if ($needsRebuild) {
-                SqliteTableRebuilder::rebuild($this->connection, $blueprint, $this->grammar);
-                return;
-            }
-        }
-
-        $this->run($this->grammar->compileAlter($blueprint));
+        return $this->bigInteger($name)->primary()->unsigned();
     }
 
-    /** @param array<int,string> $sqls */
-    private function run(array $sqls): void
+    /**
+     * Add a string column.
+     *
+     * @param string $name
+     * @param int|null $length
+     * @return Column
+     */
+    public function string(string $name, ?int $length = null): Column
     {
-        foreach ($sqls as $sql) {
-            $this->connection->execute($sql);
-        }
+        $parameters = $length ? ['length' => $length] : [];
+        return $this->addColumn($name, 'string', $parameters);
     }
 
-    private function detectSqliteVersion(): string
+    /**
+     * Add a text column.
+     *
+     * @param string $name
+     * @return Column
+     */
+    public function text(string $name): Column
     {
-        try {
-            $rows = $this->connection->query('select sqlite_version() as v');
-            $v = $rows[0]['v'] ?? '3.0.0';
-            return is_string($v) ? $v : '3.0.0';
-        } catch (\Throwable) {
-            return '3.0.0';
+        return $this->addColumn($name, 'text');
+    }
+
+    /**
+     * Add an integer column.
+     *
+     * @param string $name
+     * @return Column
+     */
+    public function integer(string $name): Column
+    {
+        return $this->addColumn($name, 'integer');
+    }
+
+    /**
+     * Add a big integer column.
+     *
+     * @param string $name
+     * @return Column
+     */
+    public function bigInteger(string $name): Column
+    {
+        return $this->addColumn($name, 'bigInteger');
+    }
+
+    /**
+     * Add a boolean column.
+     *
+     * @param string $name
+     * @return Column
+     */
+    public function boolean(string $name): Column
+    {
+        return $this->addColumn($name, 'boolean');
+    }
+
+    /**
+     * Add timestamps (created_at and updated_at).
+     *
+     * @return void
+     */
+    public function timestamps(): void
+    {
+        $this->blueprint->setOption('timestamps', true);
+        $this->timestamp('created_at')->nullable();
+        $this->timestamp('updated_at')->nullable();
+    }
+
+    /**
+     * Add a timestamp column.
+     *
+     * @param string $name
+     * @return Column
+     */
+    public function timestamp(string $name): Column
+    {
+        return $this->addColumn($name, 'timestamp');
+    }
+
+    /**
+     * Add soft deletes column.
+     *
+     * @return void
+     */
+    public function softDeletes(): void
+    {
+        $this->blueprint->setOption('softDeletes', true);
+        $this->timestamp('deleted_at')->nullable();
+    }
+
+    /**
+     * Add a generic column.
+     *
+     * @param string $name
+     * @param string $type
+     * @param array<string, mixed> $parameters
+     * @return Column
+     */
+    public function addColumn(string $name, string $type, array $parameters = []): Column
+    {
+        $typeProps = $this->typeMapper->getProperties($type);
+        $parameters = array_merge($typeProps, $parameters);
+        
+        return $this->blueprint->addColumn($name, $type, $parameters);
+    }
+
+    /**
+     * Get the underlying blueprint.
+     *
+     * @return Blueprint
+     */
+    public function getBlueprint(): Blueprint
+    {
+        return $this->blueprint;
+    }
+
+    /**
+     * Magic method to support other types from TypeMapper.
+     *
+     * @param string $method
+     * @param array<mixed> $args
+     * @return Column
+     */
+    public function __call(string $method, array $args): Column
+    {
+        if ($this->typeMapper->has($method)) {
+            return $this->addColumn($args[0], $method, $args[1] ?? []);
         }
+
+        throw new \BadMethodCallException("Method [{$method}] does not exist on " . static::class);
     }
 }

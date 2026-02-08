@@ -3,86 +3,117 @@
 
 declare(strict_types=1);
 
-require __DIR__ . '/../vendor/autoload.php';
+/**
+ * Pairity CLI Entry Point
+ *
+ * This script bootstraps the Pairity ORM CLI environment,
+ * initializes the service container, and runs the console application.
+ */
 
-use Pairity\Console\MigrateCommand;
-use Pairity\Console\RollbackCommand;
-use Pairity\Console\StatusCommand;
-use Pairity\Console\ResetCommand;
-use Pairity\Console\MakeMigrationCommand;
-use Pairity\Console\MongoIndexEnsureCommand;
-use Pairity\Console\MongoIndexDropCommand;
-use Pairity\Console\MongoIndexListCommand;
+// Search for the autoloader.
+$autoloadPath = __DIR__ . '/../vendor/autoload.php';
 
-function parseArgs(array $argv): array {
-    $args = ['_cmd' => $argv[1] ?? 'help'];
-    for ($i = 2; $i < count($argv); $i++) {
-        $a = $argv[$i];
-        if (str_starts_with($a, '--')) {
-            $eq = strpos($a, '=');
-            if ($eq !== false) {
-                $key = substr($a, 2, $eq - 2);
-                $val = substr($a, $eq + 1);
-                $args[$key] = $val;
-            } else {
-                $key = substr($a, 2);
-                $args[$key] = true;
-            }
-        } else {
-            $args[] = $a;
-        }
-    }
-    return $args;
+if (!file_exists($autoloadPath)) {
+    // Translate if possible, otherwise show English
+    $msg = "Composer autoloader not found. Please run 'composer install'.";
+    fwrite(STDERR, $msg . "\n");
+    exit(1);
 }
 
-function cmd_help(): void
-{
-    $help = <<<TXT
-Pairity CLI
+require $autoloadPath;
 
-Usage:
-  pairity migrate [--path=DIR] [--config=FILE] [--pretend]
-  pairity rollback [--steps=N] [--config=FILE] [--pretend]
-  pairity status [--path=DIR] [--config=FILE]
-  pairity reset [--config=FILE] [--pretend]
-  pairity make:migration Name [--path=DIR] [--template=FILE]
-  pairity mongo:index:ensure DB COLLECTION KEYS_JSON [--unique]
-  pairity mongo:index:drop DB COLLECTION NAME
-  pairity mongo:index:list DB COLLECTION
-
-Environment:
-  DB_DRIVER, DB_HOST, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD, DB_PATH (for sqlite)
-
-If --config is provided, it must be a PHP file returning the ConnectionManager config array.
-TXT;
-    echo $help . PHP_EOL;
-}
-
-$args = parseArgs($argv);
-$cmd = $args['_cmd'] ?? 'help';
-
-$commands = [
-    'migrate'            => MigrateCommand::class,
-    'rollback'           => RollbackCommand::class,
-    'status'             => StatusCommand::class,
-    'reset'              => ResetCommand::class,
-    'make:migration'     => MakeMigrationCommand::class,
-    'mongo:index:ensure' => MongoIndexEnsureCommand::class,
-    'mongo:index:drop'   => MongoIndexDropCommand::class,
-    'mongo:index:list'   => MongoIndexListCommand::class,
-];
-
-if ($cmd === 'help' || !isset($commands[$cmd])) {
-    cmd_help();
-    exit($cmd === 'help' ? 0 : 1);
-}
+use Pairity\Container\Container;
+use Pairity\Console\Application;
+use Pairity\Contracts\Translation\TranslatorInterface;
+use Pairity\Translation\Translator;
+use Pairity\Contracts\Database\DatabaseManagerInterface;
+use Pairity\Database\DatabaseManager;
+use Pairity\Console\Commands\DatabaseHealthCheckCommand;
 
 try {
-    $class = $commands[$cmd];
-    /** @var \Pairity\Console\CommandInterface $instance */
-    $instance = new $class();
-    $instance->execute($args);
+    // 1. Initialize the Service Container.
+    $container = new Container();
+
+    // 1.0 Register Identity Map (singleton).
+    $container->singleton(\Pairity\DTO\IdentityMap::class);
+
+    // 1.0.1 Register Proxy Factory (singleton).
+    $container->singleton(\Pairity\DTO\ProxyFactory::class);
+
+    // 1.1 Register Translator service (singleton) with path to translations.
+    $container->singleton(TranslatorInterface::class, function ($c) {
+        return new Translator(__DIR__ . '/../src/Translations');
+    });
+
+    // 1.2 Register Database Manager (singleton).
+    $container->singleton(DatabaseManagerInterface::class, function ($c) {
+        // In a real app, this config would come from a file.
+        $config = [
+            'default' => 'sqlite',
+            'connections' => [
+                'sqlite' => [
+                    'driver' => 'sqlite',
+                    'database' => ':memory:',
+                ],
+            ],
+        ];
+        return new DatabaseManager($config);
+    });
+
+    // 1.3 Register Cache and Metadata services.
+    $container->singleton(\Psr\SimpleCache\CacheInterface::class, function ($c) {
+        return new \Pairity\Cache\FileCache(__DIR__ . '/../storage/cache');
+    });
+
+    $container->singleton(\Pairity\Schema\MetadataManager::class, function ($c) {
+        return new \Pairity\Schema\MetadataManager(
+            $c->make(\Pairity\Schema\YamlSchemaParser::class),
+            $c->make(\Psr\SimpleCache\CacheInterface::class)
+        );
+    });
+
+    $container->singleton(\Pairity\Schema\CodeGenerator::class, function ($c) {
+        return new \Pairity\Schema\CodeGenerator(__DIR__ . '/../src/Stubs');
+    });
+
+    // 2. Initialize the Console Application.
+    $app = new Application($container);
+
+    // 3. Register Core Commands.
+    $app->add(\Pairity\Console\Commands\InitCommand::class);
+    $app->add(DatabaseHealthCheckCommand::class);
+    $app->add(\Pairity\Console\Commands\SyncCheckCommand::class);
+    $app->add(\Pairity\Console\Commands\GenerateJsonSchemaCommand::class);
+    $app->add(\Pairity\Console\Commands\SchemaLintCommand::class);
+    $app->add(\Pairity\Console\Commands\GenerateSchemaSnapshotCommand::class);
+    $app->add(\Pairity\Console\Commands\GenerateModelsCommand::class);
+    $app->add(\Pairity\Console\Commands\SeedCommand::class);
+    $app->add(\Pairity\Console\Commands\MakeSeederCommand::class);
+    $app->add(\Pairity\Console\Commands\MakeFactoryCommand::class);
+    $app->add(\Pairity\Console\Commands\MakeMigrationCommand::class);
+    $app->add(\Pairity\Console\Commands\RunDataMigrationCommand::class);
+    $app->add(\Pairity\Console\Commands\IntrospectCommand::class);
+    $app->add(\Pairity\Console\Commands\CacheClearCommand::class);
+    // $app->add(\Pairity\Console\Commands\MigrateCommand::class);
+
+    // 4. Run the Application.
+    $exitCode = $app->run($_SERVER['argv']);
+
+    exit($exitCode);
+
 } catch (\Throwable $e) {
-    fwrite(STDERR, 'Error: ' . $e->getMessage() . PHP_EOL);
+    // Try to use translator if available
+    $message = 'Uncaught Exception: ' . $e->getMessage();
+    try {
+        if (isset($container) && $container->has(TranslatorInterface::class)) {
+            /** @var TranslatorInterface $t */
+            $t = $container->get(TranslatorInterface::class);
+            $message = $t->trans('error.uncaught_exception', ['message' => $e->getMessage()]);
+        }
+    } catch (\Throwable $ignored) {
+        // ignore translation errors in emergency handler
+    }
+    fwrite(STDERR, $message . "\n");
+    fwrite(STDERR, $e->getTraceAsString() . "\n");
     exit(1);
 }

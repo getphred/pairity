@@ -12,3 +12,9 @@ crashlytics-build.properties
 fabric.properties
 .junie/
 .phpunit.result.cache
+LOG.md
+/schema/
+/storage/
+/src/Models/DTO/
+/src/Models/DAO/
+/src/Models/Hydrators/
