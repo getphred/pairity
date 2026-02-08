@@ -86,8 +86,12 @@ class {{class}} extends BaseDAO
      * @param {{dto_class}} $dto
      * @return bool
      */
-    public function save({{dto_class}} $dto): bool
+    public function save(\Pairity\DTO\BaseDTO $dto): bool
     {
+        if (!$dto instanceof {{dto_class}}) {
+            return parent::save($dto);
+        }
+
         if ($this->fireModelEvent('saving', $dto) === false) {
             return false;
         }
@@ -96,9 +100,9 @@ class {{class}} extends BaseDAO
         $primaryKeyValue = $data[$this->primaryKey] ?? null;
 
         if ($primaryKeyValue === null) {
-            $result = $this->insert($dto);
+            $result = $this->insert($data, $dto);
         } else {
-            $result = $this->update($dto);
+            $result = $this->update($primaryKeyValue, $data, $dto);
         }
 
         if ($result) {
@@ -111,24 +115,19 @@ class {{class}} extends BaseDAO
     /**
      * Insert a new record.
      *
-     * @param {{dto_class}} $dto
+     * @param array $data
+     * @param \Pairity\DTO\BaseDTO|null $dto
      * @return bool
      */
-    protected function insert({{dto_class}} $dto): bool
+    protected function insert(array $data, ?\Pairity\DTO\BaseDTO $dto = null): bool
     {
-        if ($this->fireModelEvent('creating', $dto) === false) {
+        if ($dto && $this->fireModelEvent('creating', $dto) === false) {
             return false;
         }
 
-        $data = $dto->toArray();
-        $columns = implode(', ', array_keys($data));
-        $placeholders = implode(', ', array_fill(0, count($data), '?'));
-        
-        $sql = "INSERT INTO {$this->table} ({$columns}) VALUES ({$placeholders})";
-        
-        $result = $this->getConnection()->execute($sql, array_values($data)) > 0;
+        $result = parent::insert($data);
 
-        if ($result) {
+        if ($result && $dto) {
             $this->fireModelEvent('created', $dto, false);
         }
 
@@ -138,32 +137,20 @@ class {{class}} extends BaseDAO
     /**
      * Update an existing record.
      *
-     * @param {{dto_class}} $dto
+     * @param mixed $id
+     * @param array $data
+     * @param \Pairity\DTO\BaseDTO|null $dto
      * @return bool
      */
-    protected function update({{dto_class}} $dto): bool
+    protected function update(mixed $id, array $data, ?\Pairity\DTO\BaseDTO $dto = null): bool
     {
-        if ($this->fireModelEvent('updating', $dto) === false) {
+        if ($dto && $this->fireModelEvent('updating', $dto) === false) {
             return false;
         }
 
-        $data = $dto->toArray();
-        $id = $data[$this->primaryKey] ?? null;
-        $sets = [];
-        $values = [];
-        
-        foreach ($data as $column => $value) {
-            if ($column === $this->primaryKey) continue;
-            $sets[] = "{$column} = ?";
-            $values[] = $value;
-        }
-        
-        $values[] = $id;
-        $sql = "UPDATE {$this->table} SET " . implode(', ', $sets) . " WHERE {$this->primaryKey} = ?";
-        
-        $result = $this->getConnection()->execute($sql, $values) > 0;
+        $result = parent::update($id, $data, $dto);
 
-        if ($result) {
+        if ($result && $dto) {
             $this->fireModelEvent('updated', $dto, false);
         }
 

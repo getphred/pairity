@@ -1,0 +1,11 @@
+columns:
+  id:
+    type: bigInteger
+    primary: true
+  email:
+    type: string
+    unique: true
+relations:
+  posts:
+    type: hasMany
+    target: posts

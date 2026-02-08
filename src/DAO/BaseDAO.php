@@ -231,9 +231,10 @@ abstract class BaseDAO
      * Insert a new record.
      *
      * @param array<string, mixed> $data
+     * @param \Pairity\DTO\BaseDTO|null $dto
      * @return bool
      */
-    protected function insert(array $data): bool
+    protected function insert(array $data, ?\Pairity\DTO\BaseDTO $dto = null): bool
     {
         if ($this->getOption('tenancy', false)) {
             $tenantColumn = \Pairity\Database\Query\Scopes\TenantScope::getTenantColumn();

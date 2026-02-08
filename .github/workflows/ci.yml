@@ -30,6 +30,7 @@ jobs:
       - name: Initialize Pairity
         run: |
           bin/pairity init
+          bin/pairity make:model tests/Fixtures/schema
 
       - name: Run tests
         run: |
